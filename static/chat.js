@@ -24,6 +24,7 @@ const chat = {
   retry: 0,
   retryTimer: 0,
   hidden: false,
+  atts: [], // attachments since the last send: { name, image, state, el }
 };
 
 const CHAT_STICK_PX = 80;
@@ -57,8 +58,10 @@ function buildChat() {
       <button type="button" data-k="shifttab" title="cycle mode">&#8679;tab</button>
       <button type="button" data-k="ctrlc">^C</button>
     </div>
+    <div class="chatatts" hidden></div>
     <form class="chatform">
       <button type="button" class="chatmore" aria-label="more keys">&#8943;</button>
+      <button type="button" class="chatattach" aria-label="attach a photo or file" title="attach a photo or file">&#128206;</button>
       <textarea class="chatinput" rows="1" placeholder="Message Claude" enterkeyhint="enter"
         autocomplete="off" autocapitalize="sentences"></textarea>
       <button type="submit" class="chatsend" aria-label="send">&#10148;</button>
@@ -102,6 +105,168 @@ function buildChat() {
     }
   });
   root.querySelector(".chatform").addEventListener("submit", (e) => { e.preventDefault(); submitChat(); });
+
+  root.querySelector(".chatattach").onclick = () => pickChatFiles();
+  // A screenshot pasted into the message box, or files dropped anywhere on
+  // the chat, are attachments too. Stopped here so the workspace's own drop
+  // handler does not also answer "drop files on the Files pane".
+  input.addEventListener("paste", (e) => {
+    const files = e.clipboardData && e.clipboardData.files;
+    if (!files || !files.length) return;
+    e.preventDefault();
+    attachChatFiles(files);
+  });
+  root.addEventListener("dragover", (e) => {
+    if (dragHasFiles(e.dataTransfer)) { e.preventDefault(); e.stopPropagation(); }
+  });
+  root.addEventListener("drop", (e) => {
+    if (!dragHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (e.dataTransfer.files.length) attachChatFiles(e.dataTransfer.files);
+  });
+}
+
+// ---- attachments ----------------------------------------------------------
+//
+// Two routes, chosen by what Claude can do with the file:
+//
+//   - A picture Claude can see (PNG, JPEG, GIF, WebP) goes through /paste,
+//     exactly as a screenshot pasted onto the terminal does: roost stores it
+//     outside the project and pastes its path into Claude's input, where it
+//     becomes "[Image #n]" — attached to the next message, not a file Claude
+//     has to be told about.
+//   - Anything else (a PDF, a log, an iPhone HEIC the paste route cannot name)
+//     is uploaded to the project root, as the Files pane's upload does, and
+//     its name is written into the message as @name so Claude reads it.
+
+const CHAT_IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// A fresh input per pick, as pickAndUpload does: a reused one fires no
+/// `change` for the same file twice. No `accept`, so a phone offers the photo
+/// library, the camera and files alike.
+function pickChatFiles() {
+  const pick = document.createElement("input");
+  pick.type = "file";
+  pick.multiple = true;
+  pick.style.position = "fixed";
+  pick.style.left = "-9999px";
+  pick.onchange = () => {
+    if (pick.files && pick.files.length) attachChatFiles(pick.files);
+    pick.remove();
+  };
+  pick.oncancel = () => pick.remove();
+  document.body.appendChild(pick);
+  pick.click();
+}
+
+function attachChatFiles(files) {
+  const list = [...files];
+  if (list.length > MAX_UPLOAD_PARTS) {
+    chatFlash(`${list.length} files at once (limit ${MAX_UPLOAD_PARTS})`);
+    return;
+  }
+  for (const f of list) {
+    const image = CHAT_IMAGE_TYPES.includes(f.type);
+    const att = { name: f.name || (image ? "image" : "file"), image, state: "up", el: null };
+    chat.atts.push(att);
+    renderChatAtt(att, f);
+    const url = image
+      ? `/paste/${chat.home}/${chat.session}`
+      : `/upload/${PROJECT}`;
+    chatPost(url, f, att);
+  }
+}
+
+function renderChatAtt(att, file) {
+  const row = chat.root.querySelector(".chatatts");
+  row.hidden = false;
+  const el = chatEl("div", "chatatt up");
+  if (att.image) {
+    const img = chatEl("img");
+    img.alt = "";
+    // A data: URL, not a blob: one — the page's CSP allows `img-src 'self'
+    // data:` and nothing else, and widening it for a thumbnail is not worth it.
+    const rd = new FileReader();
+    rd.onload = () => { img.src = rd.result; };
+    rd.readAsDataURL(file);
+    el.appendChild(img);
+  } else {
+    el.appendChild(chatEl("span", "chatatticon", "\u{1F4C4}"));
+  }
+  el.appendChild(chatEl("span", "chattname", att.name));
+  el.appendChild(chatEl("span", "chattstate", "0%"));
+  row.appendChild(el);
+  att.el = el;
+}
+
+function setChatAtt(att, state, text) {
+  att.state = state;
+  att.el.className = `chatatt ${state}`;
+  att.el.querySelector(".chattstate").textContent = text;
+  if (state === "err") att.el.title = text;
+}
+
+/// One file per request, so each chip has its own progress and its own
+/// error. XHR rather than fetch for the upload progress, as postFiles.
+function chatPost(url, file, att) {
+  const form = new FormData();
+  form.append("file", file, att.name);
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", url);
+  xhr.upload.onprogress = (e) => {
+    if (e.lengthComputable) setChatAtt(att, "up", `${Math.round((e.loaded / e.total) * 100)}%`);
+  };
+  xhr.onload = () => {
+    if (xhr.status !== 200) {
+      setChatAtt(att, "err", xhr.responseText || `error ${xhr.status}`);
+      chatFlash(`${att.name}: ${xhr.responseText || xhr.status}`);
+      return;
+    }
+    if (att.image) {
+      setChatAtt(att, "ok", "\u2713");
+      att.el.title = "attached to your next message";
+      return;
+    }
+    let body = {};
+    try { body = JSON.parse(xhr.responseText); } catch { /* checked below */ }
+    const r = (body.results || [])[0];
+    if (!r || !r.ok) {
+      const why = (r && r.error) || "upload failed";
+      setChatAtt(att, "err", why);
+      chatFlash(`${att.name}: ${why}`);
+      return;
+    }
+    setChatAtt(att, "ok", "\u2713");
+    att.el.title = "uploaded to the project";
+    mentionInChat(r.name || att.name);
+  };
+  xhr.onerror = () => {
+    setChatAtt(att, "err", "upload failed");
+    chatFlash(`${att.name}: upload failed`);
+  };
+  xhr.send(form);
+}
+
+/// Writes @name into the message where the cursor is, spaced from its
+/// neighbours, so the file is part of what the user is about to send.
+function mentionInChat(name) {
+  const input = chat.root.querySelector(".chatinput");
+  const ref = /\s/.test(name) ? `@"${name}"` : `@${name}`;
+  const at = input.selectionStart ?? input.value.length;
+  const before = input.value.slice(0, at);
+  const after = input.value.slice(at);
+  const pre = before && !/\s$/.test(before) ? " " : "";
+  const post = after && !/^\s/.test(after) ? " " : " ";
+  input.value = before + pre + ref + post + after;
+  input.dispatchEvent(new Event("input"));
+}
+
+function clearChatAtts() {
+  chat.atts = [];
+  const row = chat.root.querySelector(".chatatts");
+  row.replaceChildren();
+  row.hidden = true;
 }
 
 /// Opens the chat on a terminal. `home` is the project the terminal's socket
@@ -388,9 +553,17 @@ function chatKey(k) {
 function submitChat() {
   const input = chat.root.querySelector(".chatinput");
   const text = input.value;
-  if (!text.trim()) return;
+  // A picture already sits in Claude's input, so a message of nothing but
+  // pictures is sent with Enter alone.
+  const pictures = chat.atts.some((a) => a.image && a.state === "ok");
+  if (!text.trim() && !pictures) return;
+  if (chat.atts.some((a) => a.state === "up")) { chatFlash("still uploading — send when the ✓ appears"); return; }
   if (!chat.sock || chat.sock.readyState !== 1) { chatFlash("not connected — try again in a moment"); return; }
-  chat.sock.send(JSON.stringify({ t: "send", text }));
+  // After a picture Claude's input reads "[Image #1]", and the text would
+  // weld onto it.
+  if (text.trim()) chat.sock.send(JSON.stringify({ t: "send", text: pictures ? ` ${text}` : text }));
+  else chatKey("enter");
+  clearChatAtts();
   input.value = "";
   input.style.height = "auto";
   scrollChatToEnd(true);

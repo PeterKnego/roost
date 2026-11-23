@@ -36,6 +36,26 @@ Into the same PTY as keystrokes, so the terminal stays the source of truth:
   `\r`, in application-cursor form when the app set it.
 - **key:** esc, enter, tab, shift+tab (`\x1b[Z`), ctrl+c, arrows.
 
+## Attachments
+
+A 📎 in the composer (on a phone: photo library, camera or files), a pasted
+screenshot, or files dropped on the chat. Two routes, by what Claude can do
+with the file, and no new endpoint:
+
+- **A picture Claude can see** (PNG, JPEG, GIF, WebP) goes to `POST /paste`,
+  exactly as a screenshot pasted onto the terminal: stored outside the
+  project, its path bracket-pasted into Claude's input, where it becomes
+  `[Image #n]` on the next message. A message of only pictures is sent with
+  Enter alone; text after a picture gets a leading space.
+- **Anything else** (a PDF, a log, an iPhone HEIC `/paste` cannot name) goes
+  to `POST /upload` at the project root, and `@name` is written into the
+  message.
+
+Each file is its own request with its own chip (thumbnail or 📄, progress,
+✓ or the server's refusal); Send waits for every upload to finish.
+Thumbnails are `data:` URLs because the page's CSP allows `img-src 'self'
+data:` only.
+
 ## Socket
 
 `/ws/{project}/chat/{session}`: Origin-checked like every browser socket;
