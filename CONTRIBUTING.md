@@ -13,8 +13,11 @@ Branch off `develop`, open a pull request against `develop`. Accepted PRs are
 squash-merged. Releases are cut by the maintainer.
 
 `develop` requires a pull request and green CI, and that applies to the
-maintainer too — including the merge of `master` back into `develop` after each
-release, which therefore goes through a PR like anything else. That merge-back
+maintainer too — including the merge of `master` back into `develop`, needed
+whenever `master` holds a commit `develop` lacks (a version bump made on
+`master`, a hotfix), which therefore goes through a PR like anything else.
+Releases bump the version on `develop` before the promote, so a normal release
+needs none (see `docs/deploy.md`, "Cutting a release"). That merge-back
 PR is merged with a merge commit, never squashed: squashing it would put
 master's content on `develop` under a new SHA, and every later `develop` →
 `master` release merge would see it twice and conflict.
