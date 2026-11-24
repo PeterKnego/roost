@@ -17,14 +17,23 @@ only thing that exercises any of it.
 
 | File | Package | Version | Licence |
 |---|---|---|---|
-| `xterm.js`, `xterm.css`, `xterm-addon-fit.js` | `xterm` | not recorded when vendored | MIT |
-| `htmx.min.js` | `htmx.org` | 2.0.4 | 0BSD |
-| `highlight.min.js`, `hljs-github-dark.min.css` | `highlight.js` | 11.9.0 | BSD-3-Clause |
-| `github-markdown.min.css` | `github-markdown-css` | 5.3.3 | MIT |
-| `code-input.min.js`, `code-input.min.css` | `@webcoder49/code-input` | 2.8.3 | MIT |
-| `code-input-indent.min.js`, `code-input-auto-close-brackets.min.js` | `@webcoder49/code-input` (`plugins/`) | 2.8.3 | MIT |
-| `code-input-find-and-replace.min.{js,css}`, `code-input-go-to-line.min.{js,css}` | `@webcoder49/code-input` (`plugins/`) | 2.8.3 | MIT |
+| `xterm.js`, `xterm.css` | `@xterm/xterm` | 5.5.0 | MIT |
+| `xterm-addon-fit.js` (`lib/addon-fit.js`) | `@xterm/addon-fit` | 0.10.0 | MIT |
+| `htmx.min.js` | `htmx.org` | 2.0.11 | 0BSD |
+| `highlight.min.js`, `hljs-github-dark.min.css` | `@highlightjs/cdn-assets` | 11.12.0 | BSD-3-Clause |
+| `github-markdown.min.css` (jsDelivr's minified `github-markdown-dark.css`) | `github-markdown-css` | 5.9.0 | MIT |
+| `code-input.min.js`, `code-input.min.css` | `@webcoder49/code-input` | 2.9.0 | MIT |
+| `code-input-indent.min.js`, `code-input-auto-close-brackets.min.js` | `@webcoder49/code-input` (`plugins/`) | 2.9.0 | MIT |
+| `code-input-find-and-replace.min.{js,css}`, `code-input-go-to-line.min.{js,css}` | `@webcoder49/code-input` (`plugins/`) | 2.9.0 | MIT |
+| `daisyui-themes.css` | `daisyui` (`themes.css`) | 5.8.1 | MIT |
 | file-type/folder icons (data URIs in `static/style.css`) | `material-extensions/vscode-material-icon-theme` | 5.38.0 | MIT |
+
+**xterm is held at 5.5.** 6.0 replaced the native-scrolling `.xterm-viewport`
+div with VS Code's own scrollbar widget, and roost's touch scrolling on a phone
+is built on that div being a real scroller (`static/app.js` around the
+`.xterm-viewport` comments, `static/style.css`'s phone block). Swapped in, 6.0
+fails `tests/browser/mobile.mjs` E4 and E7: a finger no longer scrolls the
+terminal. Moving to 6 means porting that code, not replacing the file.
 
 ## The file-type icons
 

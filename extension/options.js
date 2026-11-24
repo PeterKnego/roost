@@ -1,6 +1,14 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const say = (t) => { $("msg").textContent = t; };
+// Firefox match patterns take no port (bugs 1362809, 1468162): access to
+// http://127.0.0.1:8444 is asked for as http://127.0.0.1/*.
+const FIREFOX = chrome.runtime.getURL("").startsWith("moz-extension:");
+const originPattern = (o) => {
+  const u = new URL(o);
+  return FIREFOX ? `${u.protocol}//${u.hostname}/*` : `${o}/*`;
+};
+const ALL_SITES = { origins: ["<all_urls>"] };
 
 async function load() {
   const s = await chrome.storage.local.get({ origins: [], key: "", unsafe: false, deny: [], follow: true });
@@ -14,7 +22,9 @@ async function load() {
     b.addEventListener("click", async () => {
       const cur = (await chrome.storage.local.get({ origins: [] })).origins.filter((x) => x !== o);
       await chrome.storage.local.set({ origins: cur });
-      chrome.permissions.remove({ origins: [`${o}/*`] }).catch(() => {});
+      // Another address on the same host shares the pattern in Firefox, so
+      // the grant goes only when nothing left needs it.
+      if (!cur.some((x) => originPattern(x) === originPattern(o))) chrome.permissions.remove({ origins: [originPattern(o)] }).catch(() => {});
       load();
     });
     li.append(b);
@@ -24,7 +34,21 @@ async function load() {
   $("deny").value = s.deny.join("\n");
   $("unsafe").checked = s.unsafe;
   $("follow").checked = s.follow;
+  if (FIREFOX) {
+    $("sites").hidden = false;
+    const ok = await chrome.permissions.contains(ALL_SITES);
+    $("sitestate").textContent = ok
+      ? "Allowed. roost bridge can act in the pages a Claude session you allowed asks for."
+      : "Not allowed yet. Firefox runs roost bridge's actions as scripts in the page, which needs this; until then every Claude request fails and says so.";
+    $("allowsites").hidden = ok;
+  }
 }
+
+$("allowsites").addEventListener("click", async () => {
+  const ok = await chrome.permissions.request(ALL_SITES).catch(() => false);
+  say(ok ? "Access to websites allowed." : "Firefox did not grant access to websites.");
+  load();
+});
 
 $("add").addEventListener("click", async () => {
   let origin;
@@ -32,8 +56,8 @@ $("add").addEventListener("click", async () => {
   if (origin === "null") return say("That is not an address.");
   // Asked from a click, which is what permissions.request needs. Loopback is
   // already granted by the manifest; anything else is asked for here.
-  const ok = await chrome.permissions.request({ origins: [`${origin}/*`] }).catch(() => false);
-  if (!ok) return say(`Chrome did not grant access to ${origin}.`);
+  const ok = await chrome.permissions.request({ origins: [originPattern(origin)] }).catch(() => false);
+  if (!ok) return say(`The browser did not grant access to ${origin}.`);
   const cur = (await chrome.storage.local.get({ origins: [] })).origins;
   if (!cur.includes(origin)) cur.push(origin);
   await chrome.storage.local.set({ origins: cur });

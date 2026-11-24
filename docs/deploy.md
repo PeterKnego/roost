@@ -113,23 +113,39 @@ A git worktree is its own project, and is discovered by asking
 A project's "Let roost create Claude's worktrees" setting installs Claude
 Code's `WorktreeCreate` hook (`roost worktree-hook`), so that when a Claude
 running in a roost terminal asks for a worktree, roost — not Claude Code —
-creates it, and the terminal that asked is re-homed into the new worktree's
-project. With the setting on, the request shows up as a dialog in the
-browser: with no roost tab open on that project to click it, the request is
-refused outright, since nobody is there to approve it. Outside roost
-entirely (a Claude with no `ROOST_PROJECT` set) or whenever roost itself is
-unreachable — stopped, restarting, or the hook socket otherwise refused —
-the hook falls back to creating the worktree itself, roost's own naming
-convention and all: creating a worktree destroys nothing, so that is the one
-case where falling through to "just do it" is the safe default.
+creates it. Approving the dialog no longer re-homes the terminal by itself:
+it only tells roost which worktree that terminal's Claude is expected to
+enter. The terminal follows a tick later, once `/proc` shows that Claude's
+own cwd has actually moved inside the worktree it asked for — the same
+"Move tab there" offer a worktree created some other way gets, taken
+automatically because the evidence is already in. With the setting on, the
+request shows up as a dialog in the browser: with no roost tab open on that
+project to click it, the request is refused outright, since nobody is there
+to approve it. Outside roost entirely (a Claude with no `ROOST_PROJECT` set)
+or whenever roost itself is unreachable — stopped, restarting, or the hook
+socket otherwise refused — the hook falls back to creating the worktree
+itself, roost's own naming convention and all: creating a worktree destroys
+nothing, so that is the one case where falling through to "just do it" is
+the safe default.
 
-Subagent worktrees ask too. A Claude that runs a subagent with
-`isolation: "worktree"` raises the same `WorktreeCreate` hook, and its payload
-carries nothing that tells it apart from the terminal's own request — no agent
-id or type, only a generated `agent-<hex>` name (observed on Claude Code
-2.1.296). So with the setting on, each such subagent shows the same dialog,
-re-homes the terminal when approved, and is refused at once when no roost tab
-is open on the project.
+Add a line to the project's own `CLAUDE.md` asking Claude to create
+worktrees with the `EnterWorktree` tool, so they land in
+`.claude/worktrees/` and roost can ask and follow: roost never writes into a
+project's `CLAUDE.md` itself, so this is a suggestion to add by hand, not
+something the setting does for you.
+
+Subagent worktrees ask too, and are the reason approval stopped re-homing.
+A Claude that runs a subagent with `isolation: "worktree"` raises the same
+`WorktreeCreate` hook, and its payload carries nothing that tells it apart
+from the terminal's own request — no agent id or type, only a generated
+`agent-<hex>` name (observed on Claude Code 2.1.296). Re-homing on approval
+would have moved the terminal for a subagent's worktree too, even though
+the subagent's own process is what moves and the parent Claude in that
+terminal never does. So with the setting on, each such subagent shows the
+same dialog and is refused at once when no roost tab is open on the
+project, but approving it only starts a 30-second window for the terminal
+to follow; a subagent's approval leaves that window to expire with the
+terminal exactly where it was.
 
 Turn the setting off before **downgrading** to a roost that predates it. An
 older binary does not know the `worktree-hook` subcommand and reads it as a

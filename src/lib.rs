@@ -1,6 +1,8 @@
 pub mod agents;
+pub mod appeared;
 pub mod assets;
 pub mod backup;
+pub mod chat;
 pub mod bind;
 pub mod cli;
 pub mod claudehooks;
@@ -9,6 +11,7 @@ pub mod claudehist;
 pub mod claudesess;
 pub mod cwds;
 pub mod config;
+pub mod dirid;
 pub mod errlog;
 pub mod fileops;
 pub mod gitignore;
@@ -32,6 +35,7 @@ pub mod modes;
 pub mod notify;
 pub mod origin;
 pub mod osc;
+pub mod outside;
 pub mod paste;
 pub mod zipdl;
 pub mod procsess;
@@ -92,6 +96,14 @@ pub fn serve(listener: TcpListener, startup_roots: Vec<PathBuf>) {
             report.dead_sockets, report.gone_projects
         );
     }
+    // A rename found at startup follows here, as on every throttled pass:
+    // after the sweep, with nothing locked (#158 §5). Every one, not only
+    // those this pass wrote: a previous run that died between writing
+    // `.moved-to` and following would otherwise leave its sessions stranded
+    // for good, and following is idempotent.
+    let moved: Vec<registry::Moved> =
+        report.moved.into_iter().map(|m| registry::Moved { fresh: true, ..m }).collect();
+    registry::follow_moves(&moved);
     // Not fatal: the hook is how `roost worktree-hook` (Task 8) reaches a
     // running server at all, but a project with an unwritable state dir
     // must still serve every existing project rather than refuse to start.
@@ -178,6 +190,11 @@ fn route_ws(stream: TcpStream, roots: &[PathBuf]) {
             return wsconn::handle(stream, &project, dir);
         }
         return;
+    }
+    // `/ws/{project}/chat/{name}`: the chat view of a terminal (`chat.rs`).
+    // Checked before the fallthrough below, whose parser would refuse it.
+    if segs.len() >= 3 && segs[segs.len() - 2] == "chat" {
+        return chat::handle_ws(stream, roots);
     }
     // Anything else (including a well-formed .../term/{name}) is
     // term::handle_ws's own job to parse and validate for real; this

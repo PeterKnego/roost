@@ -75,7 +75,9 @@ act at all without an open roost tab.
    have the `chrome_*` and `handoff_*` tools; a session already running needs
    `/mcp` → *roost* → *Reconnect*.
 
-2. **Load the extension.** Download `roost-extension-<version>.zip` from the
+2. **Install the extension.** In Chrome, from the
+   [Chrome Web Store](https://chromewebstore.google.com/detail/roost-bridge/kpnmhpeghnakadgjgdihmmfjcmbfdlca).
+   In Firefox, see [Firefox](#firefox) below. Or load it unpacked: download `roost-extension-<version>.zip` from the
    [release](https://github.com/PeterKnego/roost/releases) matching your
    roost, and unzip it where it can stay. In Chrome, open
    `chrome://extensions`, turn on *Developer mode*, choose *Load unpacked* and
@@ -90,6 +92,35 @@ act at all without an open roost tab.
    allow access to that address.
 
 4. **Open roost** in a tab, or reload it. That tab relays calls.
+
+## Firefox
+
+The same extension runs in Firefox 140 and later, with the same tools,
+consent window, key, deny-list and handoff. Install it from
+`roost-extension-<version>-firefox.zip` on the release page: from
+addons.mozilla.org once it is listed, or for a quick try, in
+`about:debugging` → *This Firefox* → *Load Temporary Add-on…*, picking that
+zip (a temporary add-on is gone when Firefox restarts).
+
+Firefox has no debugger API, so roost bridge drives pages differently there,
+and three things follow from it:
+
+- **It needs access to websites.** Firefox runs roost bridge's reads, clicks
+  and typing as scripts in the page and screenshots with `tabs.captureTab`,
+  and both need the optional *access to all websites*. The first consent
+  window's Allow asks for it; so does *Access to websites* in the options.
+  Each Claude session still asks you before it does anything.
+- **Clicks and typing are dispatched events.** Pages take them as normal,
+  except a page that checks whether an event came from a real person
+  (`isTrusted`). Claude's result says so when it was in Firefox.
+- **A button that opens a file picker cannot be caught.** `chrome_upload`
+  needs the `<input type=file>` itself; Claude's error says so. Console
+  messages are collected from the first `chrome_console` on, for each page
+  load, so the first moments of a load can be missed.
+
+Firefox match patterns take no port, so a roost at `http://127.0.0.1:8444`
+is granted as `http://127.0.0.1/*`. The extension still checks the full
+address, port included, before it acts on anything.
 
 ## Using it
 
@@ -160,6 +191,7 @@ the reload have to be closed by hand.
 | `the user did not allow this in the browser` | The consent window was denied, closed, or left for 2 minutes. |
 | `that is a roost tab` / `… is on your deny-list` / `… pages are never driven` | The page is off-limits by design. |
 | `tab … was not opened by this session` | `chrome_close` only closes tabs that Claude session opened. |
+| `Firefox has not given roost bridge access to websites` | Allow it in the next consent window, or in the options under *Access to websites*. |
 | No `chrome_*` tools at all | `claude mcp add` (step 1) is missing, or the session predates it: `/mcp` → *roost* → *Reconnect*. |
 
 ## Rotating the key

@@ -37,7 +37,7 @@ fn roots_socket_adds_a_root_and_refuses_a_handshake_without_origin() {
     );
     assert!(std::fs::read_to_string(&global).unwrap().contains("roots = ["), "the global file gained the list");
     // The next request sees it: the front page's roots label names it.
-    let page = ureq::get(&format!("http://127.0.0.1:{port}/")).call().unwrap().into_string().unwrap();
+    let page = ureq::get(&format!("http://127.0.0.1:{port}/")).call().unwrap().into_body().read_to_string().unwrap();
     assert!(page.contains(&dir.canonicalize().unwrap().display().to_string()), "roots are re-read per connection");
     std::env::remove_var("ROOST_CONFIG");
 }

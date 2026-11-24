@@ -138,6 +138,92 @@ pub struct Hub {
     /// sent, by construction rather than by a flag. Never persisted: the
     /// hook connection it answers does not survive a restart either.
     asks: Vec<PendingAsk>,
+    /// The non-main worktrees of this checkout as git last reported them
+    /// (canonical paths), so a new one is told apart from one that was
+    /// always there (#158 §2). `None` until git has answered once: with no
+    /// answer there is nothing to diff against, and the first answer seeds
+    /// it silently rather than announcing every worktree as new.
+    known_worktrees: Option<std::collections::BTreeSet<std::path::PathBuf>>,
+    /// Worktrees roost is itself about to `git worktree add`, noted before
+    /// the add (`note_created_worktree`). Kept apart from `known_worktrees`
+    /// rather than inserted into it: a confirm whose `git worktree list`
+    /// ran *before* the add finished would drop a not-yet-listed path from
+    /// the known set as removed, and the add's own watch event would then
+    /// announce a worktree whose page roost already opened. An entry is
+    /// consumed when it shows up, and dropped after `MADE_WORKTREE_TTL` if
+    /// the add never happened.
+    worktrees_made: Vec<(std::path::PathBuf, std::time::Instant)>,
+    /// A confirm thread is running (`worktrees_changed`). At most one per
+    /// hub, so two `git worktree list` answers can never be applied out of
+    /// order — an older list landing last would forget a worktree, and the
+    /// next event would announce it a second time.
+    worktrees_confirming: bool,
+    /// Another watch event arrived while a confirm was running; it runs once
+    /// more when it finishes, so the change that event saw is not lost.
+    worktrees_again: bool,
+    /// This project's appeared list (`appeared.rs`, #188 §3), as last
+    /// written. Kept in memory because `snapshot_event` runs on every
+    /// debounced keystroke, and every writer of the file updates this from
+    /// what it wrote: the confirm, `DismissAppeared`, and
+    /// `clear_appeared_on_open` through this hub when it is open.
+    appeared: Vec<crate::appeared::Appeared>,
+    /// Outside records the last confirm pruned, taken by `apply_worktrees`
+    /// so the confirm thread can send `ProjectsChanged` once the lock is
+    /// down (`broadcast_all` locks every hub).
+    pruned_outside: Vec<String>,
+}
+
+/// How long a worktree roost said it would make stays exempt from the
+/// banner while it has not appeared yet. Far longer than any `git worktree
+/// add`; bounded so a failed add cannot keep a path exempt forever.
+const MADE_WORKTREE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// One non-main worktree as `git worktree list` reported it, resolved off
+/// every lock into what `Event::WorktreeAppeared` carries.
+pub struct SeenWorktree {
+    /// Canonical, so it compares equal to what `note_created_worktree`
+    /// records and to the same worktree in the next listing.
+    pub path: std::path::PathBuf,
+    pub branch: String,
+    /// The worktree's roost project URL when its root is a project under a
+    /// root (`projects::project_for_abs` with an empty `rel`).
+    pub url: Option<String>,
+}
+
+/// `None` when git did not answer: `worktree::list` is empty only then,
+/// since a repository always lists at least its main checkout. "No answer"
+/// is never folded into "no worktrees" — that would read as every worktree
+/// removed, and the next answer would announce them all again.
+pub fn seen_worktrees(listed: Vec<crate::worktree::Worktree>, roots: &[std::path::PathBuf]) -> Option<Vec<SeenWorktree>> {
+    if listed.is_empty() {
+        return None;
+    }
+    Some(
+        listed
+            .into_iter()
+            .filter(|w| !w.is_main)
+            .map(|w| {
+                // A listed worktree whose directory is gone (prunable) does
+                // not canonicalise; it is still a worktree git knows about.
+                let path = w.path.canonicalize().unwrap_or(w.path);
+                let url = crate::projects::project_for_abs(roots, &path)
+                    .and_then(|(url, rel)| if rel.is_empty() { Some(url) } else { None });
+                SeenWorktree { path, branch: w.branch, url }
+            })
+            .collect(),
+    )
+}
+
+/// The production observation: git, then the resolver. Runs git, so it is
+/// called with no lock held, ever. Only a main checkout (`.git` a
+/// directory) has worktrees of its own to see; anything else answers
+/// `None` without running git at all.
+fn observe_worktrees(dir: &std::path::Path) -> Option<Vec<SeenWorktree>> {
+    match std::fs::symlink_metadata(dir.join(".git")) {
+        Ok(m) if m.is_dir() => {}
+        _ => return None,
+    }
+    seen_worktrees(crate::worktree::list(dir), &crate::projects::roots())
 }
 
 /// How long Claude's worktree ask waits for a browser before it is refused.
@@ -355,12 +441,23 @@ impl Hub {
             worktree_hooks: None,
             settings: None,
             asks: Vec::new(),
+            known_worktrees: None,
+            worktrees_made: Vec::new(),
+            worktrees_confirming: false,
+            worktrees_again: false,
+            appeared: crate::appeared::load(project),
+            pruned_outside: Vec::new(),
         };
         // A freshly loaded hub must report reality, not whatever the
         // persisted layout happened to say last time: sessions may have
         // died (or kept running under dtach) since the last save, and
         // `.git` may have appeared or vanished on disk in the meantime.
-        hub.refresh_live_sessions();
+        // Not `refresh_live_sessions`: that saves when the shells it sees
+        // differ from the file's, and here, before the loss below is
+        // computed, every restored shell that did not survive is such a
+        // difference — saving now would erase the very record the next line
+        // reads.
+        hub.refresh_live_inner();
         // Once, here, and only here: this is the single moment the restored
         // layout can be compared against what actually survived. A tab whose
         // shell is gone is indistinguishable a second later, because by then
@@ -368,6 +465,7 @@ impl Hub {
         hub.ws.lost_sessions = lost_terminal_sessions(&hub.ws, project);
         hub.ws.resumable_sessions = resumable_terminal_sessions(&hub.ws.lost_sessions, project);
         rearm_launches(&hub.ws.lost_sessions, project);
+        hub.save_if_seen_changed();
         hub.reconcile_buffers_with_disk();
         // The restored layout's terminal tabs are as much a request for those
         // sessions as a fresh click is — including `default_layout`'s own
@@ -401,10 +499,11 @@ impl Hub {
         // The same three steps `new` runs for the same reason: a restored
         // layout describes what was true on another machine, and reality here
         // is whatever actually survived.
-        self.refresh_live_sessions();
+        self.refresh_live_inner();
         self.ws.lost_sessions = lost_terminal_sessions(&self.ws, &project);
         self.ws.resumable_sessions =
             resumable_terminal_sessions(&self.ws.lost_sessions, &project);
+        self.save_if_seen_changed();
         self.reconcile_buffers_with_disk();
         self.sync_reservations();
     }
@@ -540,6 +639,15 @@ impl Hub {
             let arc2 = arc.clone();
             let project2 = project.to_string();
             std::thread::spawn(move || {
+                // Seeded before the watcher exists, so no watch event can
+                // confirm against an empty baseline first; `git worktree
+                // list` is the reason this is out here, on this thread, with
+                // no lock held until the answer is in.
+                let seen = std::panic::catch_unwind(|| observe_worktrees(&dir)).unwrap_or(None);
+                let pruned = Hub::lock(&arc2).seed_worktrees(seen);
+                if !pruned.is_empty() {
+                    broadcast_all(&Event::ProjectsChanged { project: project2.clone() });
+                }
                 let ok = crate::watch::spawn(&project2, dir, arc2.clone(), std::time::Duration::from_millis(ms));
                 let mut h = Hub::lock(&arc2);
                 h.ws.watch_degraded = !ok;
@@ -669,7 +777,53 @@ impl Hub {
         // See the doc comment on `settings` for why this is cached rather
         // than read on every call.
         ws.settings = self.settings.get_or_insert_with(|| crate::config::settings_view(&self.dir)).clone();
+        ws.appeared = self.appeared_view();
         Event::State { version: self.ws.version, origin: origin.clone(), ws }
+    }
+
+    /// The appeared list resolved for display. Fork-free, since it runs
+    /// under this hub's lock: `project_for_abs` and `outside::resolve` are
+    /// stats and small reads. Nothing is computed for an empty list, which
+    /// is the usual case — not even the roots, which can mean a config read.
+    fn appeared_view(&self) -> Vec<crate::proto::AppearedView> {
+        if self.appeared.is_empty() {
+            return Vec::new();
+        }
+        let roots = crate::projects::roots();
+        let canon_roots: Vec<std::path::PathBuf> =
+            roots.iter().map(|r| r.canonicalize().unwrap_or_else(|_| r.clone())).collect();
+        self.appeared
+            .iter()
+            .map(|a| {
+                let p = std::path::Path::new(&a.path);
+                let outside = !canon_roots.iter().any(|r| p.starts_with(r));
+                let (url, allowed) = if outside {
+                    match crate::outside::find(&self.project, p) {
+                        Some(rec) if crate::outside::resolve(&self.project, &rec.name).is_some() => {
+                            (Some(crate::outside::url_for(&self.project, &rec.name)), true)
+                        }
+                        _ => (None, false),
+                    }
+                } else {
+                    let url = crate::projects::project_for_abs(&roots, p)
+                        .and_then(|(url, rel)| if rel.is_empty() { Some(url) } else { None });
+                    (url, false)
+                };
+                crate::proto::AppearedView { path: a.path.clone(), branch: a.branch.clone(), url, outside, allowed }
+            })
+            .collect()
+    }
+
+    /// Drops `path` from the appeared list and, if that changed anything,
+    /// tells every browser on the project — every one, since a banner one
+    /// tab dismissed must not linger in another.
+    pub fn dismiss_appeared(&mut self, path: &str) {
+        let after = crate::appeared::remove(&self.project, path);
+        if after != self.appeared {
+            self.appeared = after;
+            let snap = self.snapshot_event(&String::new());
+            self.broadcast(&snap);
+        }
     }
 
     /// Every terminal tab in this layout is reserved, so the browser that
@@ -706,6 +860,9 @@ impl Hub {
     }
 
     fn persist(&mut self) {
+        // What the file now says, so `save_if_seen_changed` compares against
+        // the disk rather than against the set this hub was loaded with.
+        self.ws.sessions_seen = crate::wsstate::sessions_seen(&self.ws);
         if let Err(e) = crate::wsstate::save(&self.project.clone(), &self.ws) {
             eprintln!("roost: state save failed: {e}");
         }
@@ -886,6 +1043,13 @@ impl Hub {
                 return self.do_new_worktree(from, name.clone(), launch.clone())
             }
             Intent::RemoveWorktree { key } => return self.do_remove_worktree(from, key.clone()),
+            Intent::AllowOutsideWorktree { parent, path } => {
+                return self.do_allow_outside(from, parent.clone(), path.clone())
+            }
+            Intent::RevokeOutsideWorktree { parent, name } => {
+                return self.do_revoke_outside(from, parent.clone(), name.clone())
+            }
+            Intent::DismissAppeared { path } => return self.dismiss_appeared(&path.clone()),
             Intent::NewTerminal { pane, launch, force, resume, fork } => {
                 return self.do_new_terminal(from, *pane, *launch, *force, resume.clone(), fork.clone())
             }
@@ -1677,7 +1841,30 @@ impl Hub {
     /// `Hub::new` — which itself runs under the process-global hub-registry
     /// lock (`for_project`'s `or_insert_with`) — so that cost would stall
     /// every other project's connection setup, not just this one's.
+    /// Rebuilds the live set, and saves when it changed what a save would
+    /// record (`wsstate::sessions_seen`). That save is the only durable
+    /// evidence a tab ever had a shell, and it used to ride on layout saves
+    /// alone: a shell started in an existing tab saves no layout, so a
+    /// terminal nobody rearranged afterwards was never recorded, and a
+    /// reboot — or any container restart — brought it back as a tab with
+    /// nothing lost and nothing to resume. Every attach reaches here
+    /// (`term.rs`), so this is where a new shell gets written down.
     pub fn refresh_live_sessions(&mut self) {
+        self.refresh_live_inner();
+        self.save_if_seen_changed();
+    }
+
+    fn save_if_seen_changed(&mut self) {
+        let mut now = crate::wsstate::sessions_seen(&self.ws);
+        let mut saved = self.ws.sessions_seen.clone();
+        now.sort();
+        saved.sort();
+        if now != saved {
+            self.persist();
+        }
+    }
+
+    fn refresh_live_inner(&mut self) {
         // `owned_live_names`, which is `live_names` adjusted by the re-home
         // records and is fork-free for the same reason.
         let owned = crate::session::owned_live_names(&self.project);
@@ -2261,7 +2448,20 @@ impl Hub {
                         .ok_or_else(|| "could not find a free worktree name".to_string())?
                 }
             };
+            // Before the add, so its watch event finds it expected (#158
+            // §2): this flow opens the page itself. Never under this hub's
+            // lock — `work` runs on its own thread whenever the hub is in
+            // the registry, and only a bare test hub (never registered, so
+            // `note_created_worktree` finds nothing to lock) runs it inline.
+            if let Some(p) = planned_worktree_path(&dir, &resolved) {
+                note_created_worktree(&project, &p);
+            }
             let c = crate::worktree::create_named(&dir, &crate::wsstate::state_dir(), &resolved, &key_of, &crate::worktree::real_git)?;
+            // Logged, not returned, for `approve_ask`'s reason: the
+            // worktree exists, so this is not a failed creation.
+            for e in crate::claudehooks::inherit(&dir, &c.path) {
+                eprintln!("roost: could not install a hook into {}: {e}", c.path.display());
+            }
             Ok(format!("{project}/.claude/worktrees/{}", c.name))
         };
         // Delivers the reply under the hub lock and hands back the url on
@@ -2391,23 +2591,18 @@ impl Hub {
         // tab back rather than merely refresh what is already there — see
         // `retab_native_if_missing`'s own doc comment for why that is not
         // folded into a plain `refresh_and_broadcast` everywhere.
+        //
+        // `Some(url)` needs neither: `rehome_to` already refreshes the home,
+        // the prior owner and the new owner and broadcasts `ProjectsChanged`
+        // itself, so only the requester's own `finish` snapshot remains.
         let mut plains: Vec<String> = Vec::new();
         let mut retabs: Vec<String> = Vec::new();
-        match &to {
-            Some(url) => {
-                plains.push(url.clone());
-                if let Some(o) = &prior_owner {
-                    if o != url {
-                        plains.push(o.clone());
-                    }
-                }
-            }
-            None => {
-                retabs.push(home.clone());
-                if let Some(o) = &prior_owner {
-                    if o != &self.project {
-                        plains.push(o.clone());
-                    }
+        let follow_up = to.is_none();
+        if follow_up {
+            retabs.push(home.clone());
+            if let Some(o) = &prior_owner {
+                if o != &self.project {
+                    plains.push(o.clone());
                 }
             }
         }
@@ -2458,12 +2653,14 @@ impl Hub {
                     if crate::home::owner_path(&work_home, &url).is_none() {
                         return Err(format!("{url}: not a {work_home}/.claude/worktrees worktree"));
                     }
-                    // R16: a resident must never shadow a native session of
-                    // the same name at its new owner.
-                    if crate::session::live_names(&url).contains(&work_session) {
-                        return Err(format!("{work_session} already exists in {url}"));
-                    }
-                    crate::home::record(&work_home, &work_session, &url)
+                    // From here on it's the same path the claudes watcher
+                    // calls with no connection and no git of its own (an
+                    // expected move landing): R16, record, refresh.
+                    // `rehome_to` does its own refresh of home/prior-owner/
+                    // new-owner, off any lock — this closure already runs
+                    // there, in the spawned thread (or, in the sync fallback
+                    // below, with no hub lock taken for `work` either).
+                    crate::hub::rehome_to(&work_home, &work_session, &url)
                 }
             }
         };
@@ -2499,7 +2696,7 @@ impl Hub {
                         let mut h = Hub::lock(&arc);
                         finish(&mut h, &r);
                     }
-                    if ok {
+                    if ok && follow_up {
                         for p in &plains2 {
                             crate::hub::refresh_and_broadcast(p);
                         }
@@ -2517,7 +2714,7 @@ impl Hub {
                 let r = work();
                 let ok = r.is_ok();
                 finish(self, &r);
-                if ok {
+                if ok && follow_up {
                     for p in &plains {
                         crate::hub::refresh_and_broadcast(p);
                     }
@@ -2676,6 +2873,160 @@ impl Hub {
         }
     }
 
+    /// `AllowOutsideWorktree` (#188, spec §1): records one git worktree
+    /// outside the roots so it opens under `<parent>/.claude/outside/<name>`.
+    ///
+    /// Every check is made against `parent`, never against this hub: the
+    /// switcher that offers the action sits in every page's header, so the
+    /// sender may be a sibling worktree's page. `outside::allow` validates
+    /// the path itself (absolute, canonical, a directory, a pinnable
+    /// identity) but deliberately never consults git — that `path` is really
+    /// a non-main worktree of `parent` right now is this function's job, and
+    /// it is the evidence the whole record rests on. An empty listing is git
+    /// not answering, not "no worktrees": it refuses with its own message
+    /// and writes nothing (CLAUDE.md, absence of evidence).
+    ///
+    /// Shape as `do_remove_worktree`: cheap string checks here under the
+    /// hub lock, then git and the record write on a spawned thread with no
+    /// lock held, then the refresh and broadcasts with no lock held either
+    /// (`refresh_and_broadcast` and `broadcast_all` lock hubs, this one
+    /// possibly included). The reply goes to the sender only.
+    fn do_allow_outside(&mut self, from: &ConnId, parent: String, path: String) {
+        if let Err(msg) = outside_parent_ok(&parent) {
+            return self.send_to(from, &Event::Error { msg });
+        }
+        let work_parent = parent.clone();
+        let work = move || -> Result<Option<Event>, String> {
+            let parent = work_parent;
+            let roots = crate::projects::roots();
+            let parent_dir = crate::projects::resolve_project(&roots, &parent)
+                .ok_or_else(|| format!("{parent} does not resolve under roost's roots; nothing was allowed"))?;
+            let listed = crate::worktree::list(&parent_dir);
+            if listed.is_empty() {
+                return Err("git did not answer; nothing was allowed".into());
+            }
+            let not_listed = || format!("{path} is not a worktree of {parent}");
+            let canon = std::path::Path::new(&path).canonicalize().map_err(|_| not_listed())?;
+            let is_listed = listed
+                .iter()
+                .filter(|w| !w.is_main)
+                .any(|w| w.path.canonicalize().map(|c| c == canon).unwrap_or(false));
+            if !is_listed {
+                return Err(not_listed());
+            }
+            // One directory, one project key. git lists every worktree from
+            // any checkout of the repository, so both checks below are
+            // needed: without them a worktree already openable under the
+            // roots, or one recorded under a sibling worktree named as
+            // `parent`, gets a second key — its sessions, buffers, Close
+            // Project and overview rows split between the two, and a record
+            // under a non-main parent that nothing ever prunes. A worktree
+            // under a dot directory inside a root has no project URL
+            // (`project_for_abs` answers `None`) and stays allowable.
+            if let Some((url, rel)) = crate::projects::project_for_abs(&roots, &canon) {
+                if rel.is_empty() {
+                    return Err(format!("{} is already under roost's roots — open it at {url}", canon.display()));
+                }
+            }
+            let parent_canon = parent_dir
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve {parent}'s directory: {e}"))?;
+            let main = listed.iter().find(|w| w.is_main);
+            let parent_is_main = main
+                .and_then(|m| m.path.canonicalize().ok())
+                .is_some_and(|c| c == parent_canon);
+            if !parent_is_main {
+                let from = main
+                    .and_then(|m| crate::projects::project_for_abs(&roots, &m.path))
+                    .filter(|(_, rel)| rel.is_empty())
+                    .map(|(url, _)| url)
+                    .unwrap_or_else(|| "its main checkout's page".into());
+                return Err(format!("{parent} is not the repository's main checkout; allow it from {from}"));
+            }
+            // The listing is matched by canonical path here and the identity
+            // pinned later, inside `outside::allow`; the window between the
+            // two is tiny and only the user's own rename can land in it.
+            // The original `path`, not `canon`: `outside::allow` refuses a
+            // path that is not its own canonicalisation, and that refusal
+            // must see what the browser sent.
+            let rec = {
+                let _serial = OUTSIDE_ALLOW_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                crate::outside::allow(&parent, std::path::Path::new(&path))
+            }
+            .map_err(|e| format!("cannot allow {path}: {e}"))?;
+            Ok(Some(Event::OutsideAllowed { url: crate::outside::url_for(&parent, &rec.name) }))
+        };
+        self.run_outside(from, parent, "allow-outside", work);
+    }
+
+    /// `RevokeOutsideWorktree` (#188, spec §1 "Revocation"): deletes the
+    /// record and nothing else. No session, layout or `.base` under the
+    /// virtual URL is touched — the page stops resolving and a live session
+    /// stays alive, kept from the sweep by its `.origin`'s real path. On
+    /// success every page, the clicker's included, hears `ProjectsChanged`,
+    /// and the clicker alone then gets `OutsideRevoked` — the overview
+    /// waits on that, since a `ProjectsChanged` for the parent can come
+    /// from anything else that changes it.
+    fn do_revoke_outside(&mut self, from: &ConnId, parent: String, name: String) {
+        if let Err(msg) = outside_parent_ok(&parent) {
+            return self.send_to(from, &Event::Error { msg });
+        }
+        let work_parent = parent.clone();
+        let work = move || -> Result<Option<Event>, String> {
+            crate::outside::revoke(&work_parent, &name).map_err(|e| format!("cannot revoke {name}: {e}"))?;
+            Ok(Some(Event::OutsideRevoked { parent: work_parent, name }))
+        };
+        self.run_outside(from, parent, "revoke-outside", work);
+    }
+
+    /// The thread-or-sync tail both outside intents share. `work` runs with
+    /// no lock held; on success the parent's hub is refreshed and every
+    /// switcher told (`ProjectsChanged`), still with no lock held, and only
+    /// then is the sender's own reply delivered under a short re-lock of
+    /// this hub — so by the time the clicker hears back, every other page
+    /// already has. A failure changes nothing and is told to the sender
+    /// alone.
+    fn run_outside<W>(&mut self, from: &ConnId, parent: String, thread: &str, work: W)
+    where
+        W: FnOnce() -> Result<Option<Event>, String> + Send + 'static,
+    {
+        fn after(parent: &str, r: &Result<Option<Event>, String>) {
+            if r.is_ok() {
+                refresh_and_broadcast(parent);
+                broadcast_all(&Event::ProjectsChanged { project: parent.to_string() });
+            }
+        }
+        fn reply(h: &mut Hub, to: &ConnId, r: Result<Option<Event>, String>) {
+            match r {
+                Ok(Some(ev)) => h.send_to(to, &ev),
+                Ok(None) => {}
+                Err(msg) => h.send_to(to, &Event::Error { msg }),
+            }
+        }
+        match self.self_ref.upgrade() {
+            Some(arc) => {
+                let to = from.clone();
+                let spawned = std::thread::Builder::new().name(thread.into()).spawn(move || {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+                        .unwrap_or_else(|_| Err("the outside-worktree request panicked; nothing was changed".into()));
+                    after(&parent, &r);
+                    reply(&mut Hub::lock(&arc), &to, r);
+                });
+                if spawned.is_err() {
+                    let ev = Event::Error { msg: "could not start the outside-worktree request".into() };
+                    self.send_to(from, &ev);
+                }
+            }
+            // A `Hub::new` outside `REGISTRY` (unit tests only): nothing
+            // registered is this hub, so the broadcasts cannot re-lock it.
+            None => {
+                let r = work();
+                after(&parent, &r);
+                reply(self, from, r);
+            }
+        }
+    }
+
     /// Opens a terminal on a server-allocated name. See
     /// `session::next_free_name` for why the client must not choose it.
     fn do_new_terminal(
@@ -2818,6 +3169,27 @@ impl Hub {
         let rel = match crate::projects::resolve_terminal_path(&self.dir, &text) {
             Ok(rel) => rel,
             Err(msg) => {
+                // Before giving up: `resolve_terminal_path` only ever
+                // confines against *this* project, so a link into a
+                // different roost project reads as the same "outside this
+                // project" refusal it gives an escape to nowhere in
+                // particular. `terminal_abs` recovers the absolute path it
+                // would have compared (never touching disk itself), and
+                // `project_for_abs` — fork-free, safe under the hub lock —
+                // says whether some *other* project actually owns it
+                // (spec §3, #158). `url == self.project` means it doesn't:
+                // either a directory, an unreadable file, or anything else
+                // `resolve_terminal_path` refuses for a reason that has
+                // nothing to do with confinement, and the original refusal
+                // is exactly right for that.
+                if let Some((abs, line)) = crate::projects::terminal_abs(&text) {
+                    if let Some((url, rel)) = crate::projects::project_for_abs(&crate::projects::roots(), &abs) {
+                        if url != self.project {
+                            let ev = Event::PathElsewhere { project: url, rel, line };
+                            return self.send_to(from, &ev);
+                        }
+                    }
+                }
                 let ev = Event::PathRefused { text, msg };
                 return self.send_to(from, &ev);
             }
@@ -3309,6 +3681,293 @@ fn open_hub(project: &str) -> Option<Arc<Mutex<Hub>>> {
     map.get(project).cloned()
 }
 
+// ---- #158 §2: a worktree that appears from anywhere -----------------------
+
+impl Hub {
+    /// The known set as the watcher found it at start, so a worktree that
+    /// already existed is never announced. Applies only while nothing has
+    /// been seeded yet: a confirm that already ran knows better than a
+    /// listing taken before it.
+    ///
+    /// The seed is an answer, so it also clears what dropped out of it — a
+    /// worktree removed while roost was stopped — but only while it is the
+    /// baseline: a seed listing older than a confirm that already ran could
+    /// lack a worktree made since, and must not clear it. Returns the outside
+    /// records it pruned, so the caller can tell every switcher once no
+    /// lock is held.
+    pub fn seed_worktrees(&mut self, seen: Option<Vec<SeenWorktree>>) -> Vec<String> {
+        if let (None, Some(seen)) = (&self.known_worktrees, seen) {
+            let before = self.appeared.clone();
+            let pruned = self.retain_listed(&seen);
+            self.known_worktrees = Some(seen.into_iter().map(|w| w.path).collect());
+            if self.appeared != before {
+                let snap = self.snapshot_event(&String::new());
+                self.broadcast(&snap);
+            }
+            return pruned;
+        }
+        Vec::new()
+    }
+
+    /// What dropped out of a listing git actually gave is gone (§3
+    /// "Dismissing", §1 "Revocation"): its appeared entry and its outside
+    /// allow record. The main checkout goes in too — `seen` leaves it out —
+    /// so an answer of "only main" is the non-empty listing it really was,
+    /// and clears the last worktree's entry instead of reaching the
+    /// empty-listing guard both callees keep. Small atomic writes to roost's
+    /// own state, under the lock, as `home::record` is; never git. Returns
+    /// the outside records removed.
+    fn retain_listed(&mut self, seen: &[SeenWorktree]) -> Vec<String> {
+        let mut listed: Vec<std::path::PathBuf> = seen.iter().map(|w| w.path.clone()).collect();
+        if let Ok(main) = self.dir.canonicalize() {
+            listed.push(main);
+        }
+        if listed.is_empty() {
+            return Vec::new();
+        }
+        self.appeared = crate::appeared::retain_listed(&self.project, &listed);
+        crate::outside::prune(&self.project, &listed)
+    }
+
+    /// Diffs a listing against the known set and returns one
+    /// `WorktreeAppeared` per path that is new. Pure apart from `self`, so
+    /// tests hand it a listing; the watcher's thread hands it git's.
+    ///
+    /// Three outcomes, never two: `None` (git did not answer) changes
+    /// nothing at all; an answer with no known set yet only seeds it, since
+    /// without a baseline every worktree would read as new; and only an
+    /// answer against a baseline announces. A path that dropped out is
+    /// forgotten without a word — finishing a worktree is #157's.
+    pub fn confirm_worktrees(&mut self, seen: Option<Vec<SeenWorktree>>) -> Vec<Event> {
+        let Some(seen) = seen else { return Vec::new() };
+        // An answer, the seeding one included: clear what dropped out.
+        let pruned = self.retain_listed(&seen);
+        self.pruned_outside.extend(pruned);
+        let now = std::time::Instant::now();
+        self.worktrees_made.retain(|(_, at)| now.duration_since(*at) < MADE_WORKTREE_TTL);
+        let Some(known) = &self.known_worktrees else {
+            self.known_worktrees = Some(seen.into_iter().map(|w| w.path).collect());
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        for w in &seen {
+            if known.contains(&w.path) {
+                continue;
+            }
+            if let Some(i) = self.worktrees_made.iter().position(|(p, _)| *p == w.path) {
+                self.worktrees_made.remove(i);
+                continue;
+            }
+            let path = w.path.to_string_lossy().into_owned();
+            eprintln!(
+                "roost: {}: worktree {} ({}) appeared{}",
+                self.project,
+                path,
+                w.branch,
+                if w.url.is_none() { ", outside roost's roots" } else { "" }
+            );
+            // Persisted under the lock: a small atomic write to roost's own
+            // state, the cost `home::record` already pays here. Never git.
+            self.appeared = crate::appeared::add(
+                &self.project,
+                crate::appeared::Appeared { path: path.clone(), branch: w.branch.clone() },
+            );
+            events.push(Event::WorktreeAppeared { path, branch: w.branch.clone(), url: w.url.clone() });
+        }
+        self.known_worktrees = Some(seen.into_iter().map(|w| w.path).collect());
+        events
+    }
+
+    /// A worktree in the known set was renamed (#158 §5): any of `olds`
+    /// becomes `new`, so the rename is never announced as a worktree that
+    /// appeared. Returns whether this hub knew one of them.
+    pub fn rename_known_worktree(&mut self, olds: &[std::path::PathBuf], new: &std::path::Path) -> bool {
+        let Some(known) = &mut self.known_worktrees else { return false };
+        let before = known.len();
+        known.retain(|p| !olds.contains(p));
+        if known.len() == before {
+            return false;
+        }
+        known.insert(new.to_path_buf());
+        true
+    }
+
+    /// `confirm_worktrees`, then tell this project's browsers. Returns the
+    /// outside records it pruned; the caller, once it holds no lock, tells
+    /// every switcher (`ProjectsChanged`).
+    pub fn apply_worktrees(&mut self, seen: Option<Vec<SeenWorktree>>) -> Vec<String> {
+        let before = self.appeared.clone();
+        for ev in self.confirm_worktrees(seen) {
+            self.broadcast(&ev);
+        }
+        // After the one-shot events, so a client that still shows those
+        // sees them first; the snapshot is what a later page will see.
+        if self.appeared != before {
+            let snap = self.snapshot_event(&String::new());
+            self.broadcast(&snap);
+        }
+        std::mem::take(&mut self.pruned_outside)
+    }
+
+    /// The watcher saw `.git/worktrees` change. Called with this hub's lock
+    /// held (the batch loop's `h`), so it only starts a thread: `git
+    /// worktree list` runs there with no lock, and the lock is retaken just
+    /// long enough to diff and broadcast. One thread at a time per hub — an
+    /// event that lands while one runs asks it to go round once more.
+    ///
+    /// `me` is this hub's own `Arc`, passed in rather than taken from
+    /// `self_ref` so a watcher on a hub `for_project` did not build (the
+    /// watch tests') still confirms.
+    pub fn worktrees_changed(&mut self, me: &Arc<Mutex<Hub>>) {
+        if self.worktrees_confirming {
+            self.worktrees_again = true;
+            return;
+        }
+        self.worktrees_confirming = true;
+        let arc = me.clone();
+        let dir = self.dir.clone();
+        let spawned = std::thread::Builder::new().name("worktrees-confirm".into()).spawn(move || loop {
+            let seen = std::panic::catch_unwind(|| observe_worktrees(&dir)).unwrap_or_else(|_| {
+                eprintln!("roost: worktree listing panicked; no worktree banner this time");
+                None
+            });
+            let mut h = Hub::lock(&arc);
+            let pruned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.apply_worktrees(seen)))
+                .unwrap_or_else(|_| {
+                    eprintln!("roost: worktree confirm panicked; no worktree banner this time");
+                    Vec::new()
+                });
+            let again = std::mem::take(&mut h.worktrees_again);
+            if !again {
+                h.worktrees_confirming = false;
+            }
+            let project = h.project.clone();
+            drop(h);
+            if !pruned.is_empty() {
+                let _ = std::panic::catch_unwind(|| broadcast_all(&Event::ProjectsChanged { project: project.clone() }));
+            }
+            if !again {
+                break;
+            }
+        });
+        if spawned.is_err() {
+            // No thread, so no one will clear the flag; leaving it set would
+            // silence every later event for the life of the process.
+            self.worktrees_confirming = false;
+        }
+    }
+
+    /// Remembers that roost is about to make the worktree at `path`, so its
+    /// appearance is not announced. `path` must be canonical, as
+    /// `seen_worktrees` reports.
+    fn note_made_worktree(&mut self, path: std::path::PathBuf) {
+        self.worktrees_made.retain(|(p, _)| *p != path);
+        self.worktrees_made.push((path, std::time::Instant::now()));
+    }
+}
+
+/// The parent project of a worktree page, or `None` for any page that is
+/// not one. Three shapes: `<parent>/.claude/worktrees/<name>` and an outside
+/// one's virtual `<parent>/.claude/outside/<name>`, read off the URL; and a
+/// worktree anywhere else under the roots (a sibling made by `git worktree
+/// add ../x`, URL `x`), read off its `.git` file, which names the main
+/// checkout. Fork-free — at most one small read and the stats of
+/// `project_for_abs` — and called off every lock (`wsconn`, before it
+/// decides whether to spawn the clear at all).
+///
+/// Every doubt is "no parent", so nothing is cleared: a `.git` that is a
+/// directory (a main checkout), unreadable, or not of the exact
+/// `gitdir: <main>/.git/worktrees/<n>` shape; a main checkout under no root,
+/// or one that is not a project's own root.
+pub fn worktree_parent(url: &str, dir: &std::path::Path) -> Option<String> {
+    if let Some((parent, _)) = crate::outside::split_url(url) {
+        return Some(parent.to_string());
+    }
+    const SEP: &str = "/.claude/worktrees/";
+    if let Some(i) = url.find(SEP) {
+        let (parent, name) = (&url[..i], &url[i + SEP.len()..]);
+        if !parent.is_empty() && !name.is_empty() && !name.contains('/') {
+            return Some(parent.to_string());
+        }
+    }
+    let main = main_checkout_of(dir)?;
+    match crate::projects::project_for_abs(&crate::projects::roots(), &main) {
+        Some((parent, rel)) if rel.is_empty() && parent != url => Some(parent),
+        _ => None,
+    }
+}
+
+/// `<main>` from a linked worktree's `.git` file, `gitdir:
+/// <main>/.git/worktrees/<n>`. A relative gitdir (`worktree.useRelativePaths`)
+/// is taken relative to `dir`, as git does.
+fn main_checkout_of(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let md = std::fs::symlink_metadata(dir.join(".git")).ok()?;
+    if !md.is_file() || md.len() > 4096 {
+        return None;
+    }
+    let raw = std::fs::read_to_string(dir.join(".git")).ok()?;
+    let line = raw.strip_suffix('\n').unwrap_or(&raw);
+    if line.contains('\n') {
+        return None;
+    }
+    let gitdir = std::path::Path::new(line.strip_prefix("gitdir: ")?);
+    let gitdir = if gitdir.is_absolute() { gitdir.to_path_buf() } else { dir.join(gitdir) };
+    let worktrees = gitdir.parent()?;
+    let dotgit = worktrees.parent()?;
+    if gitdir.file_name().is_none()
+        || worktrees.file_name()? != "worktrees"
+        || dotgit.file_name()? != ".git"
+    {
+        return None;
+    }
+    Some(dotgit.parent()?.to_path_buf())
+}
+
+/// A worktree page was opened: that is the user seeing the worktree, so its
+/// banner leaves `parent`'s appeared list (§3). `parent` is what
+/// `worktree_parent` found for the page. Runs on its own thread, after the
+/// connection's first `State` and with no lock held (`wsconn` spawns it):
+/// the canonicalise and the file read are off every lock, and only a parent
+/// whose list really holds this path is touched at all. Through the
+/// parent's hub when one is open, so its in-memory copy and every browser
+/// on it learn of the change; straight to the file when none is.
+pub fn clear_appeared_on_open(parent: &str, dir: &std::path::Path) {
+    let Ok(canon) = dir.canonicalize() else { return };
+    let path = canon.to_string_lossy().into_owned();
+    if !crate::appeared::load(parent).iter().any(|a| a.path == path) {
+        return;
+    }
+    match open_hub(parent) {
+        Some(arc) => Hub::lock(&arc).dismiss_appeared(&path),
+        None => {
+            crate::appeared::remove(parent, &path);
+        }
+    }
+}
+
+/// Called by roost's own creation paths **before** their `git worktree
+/// add`, so the watch event that add raises finds the worktree already
+/// expected. Locks the project's hub through the registry, so the caller
+/// must hold no hub lock — both callers run off-lock on their own threads.
+/// A project with no open hub has no watcher and nothing to tell.
+pub fn note_created_worktree(project: &str, path: &std::path::Path) {
+    if let Some(arc) = open_hub(project) {
+        Hub::lock(&arc).note_made_worktree(path.to_path_buf());
+    }
+}
+
+/// Where `create_named` will put worktree `name` of `dir`, canonical as
+/// `git worktree list` reports it — computed before the add, when the
+/// worktree itself does not yet exist to be canonicalised. `None` when the
+/// project directory cannot be resolved, in which case `create_named`
+/// refuses for the same reason.
+fn planned_worktree_path(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let base = dir.canonicalize().ok()?;
+    let parent = base.join(".claude/worktrees");
+    let parent = parent.canonicalize().unwrap_or(parent);
+    Some(parent.join(crate::wtname::dir_name(name)))
+}
+
 fn ask_refuse(msg: impl Into<String>) -> crate::hooksock::AskReply {
     crate::hooksock::AskReply::Refuse { refuse: msg.into() }
 }
@@ -3418,6 +4077,12 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
     let mut created: Option<String> = None;
     let work = std::panic::AssertUnwindSafe(|| -> Result<String, String> {
         let key_of = |n: &str| crate::projects::storage_key(&format!("{project}/.claude/worktrees/{n}"));
+        // Before the add, so the watch event it raises is not announced as a
+        // worktree roost did not make (#158 §2) — the clicker's tab is
+        // already being navigated there. Off every lock, like all of this.
+        if let Some(p) = planned_worktree_path(&dir, &name) {
+            note_created_worktree(&project, &p);
+        }
         let c = crate::worktree::create_named(
             &dir,
             &crate::wsstate::state_dir(),
@@ -3432,40 +4097,34 @@ fn approve_ask(project: String, dir: std::path::PathBuf, clicker: ConnId, ask: P
         // the destructive step this codebase demands positive evidence for —
         // an empty worktree in the switcher is the honest leftover.
         //
-        // R16: within one owner a name is held by at most one live session.
-        // A brand-new worktree has none, but the record is what would make
-        // two of them share a name, so it is checked rather than assumed.
-        if crate::session::live_names(&owner).contains(&session) {
-            return Err(format!("{} already has a terminal named {session}", c.name));
-        }
-        crate::home::record(&project, &session, &owner).map_err(|e| {
-            format!("{} was created, but roost could not record that {session} moved there: {e}", c.name)
-        })?;
-        // Install the worktree hook into the new worktree's own
+        // No re-home here (#158 §1): the ask is indistinguishable from a
+        // subagent's `isolation: "worktree"`, which never moves the parent
+        // Claude, so approving records only that this terminal's Claude is
+        // expected there. The claudes watcher re-homes it — R16 included,
+        // through `rehome_to` — once `/proc` shows that Claude's cwd inside
+        // this exact worktree.
+        crate::claudes::expect_move(&project, &session, &owner);
+        // Install roost's hooks into the new worktree's own
         // `.claude/settings.local.json`, mirroring whatever the main
-        // checkout has: a worktree Claude never ran `roost worktree-hook`
-        // from `dir` to enable it, so it inherits the setting instead of
-        // starting cold every time. Off the hub lock — `dir` and `c.path`
-        // are plain paths, and `claudehooks::set_kind` does its own file
-        // I/O with no lock involved.
+        // checkout has: nobody ever enabled them from the worktree, so it
+        // inherits the settings instead of starting cold every time. Off
+        // the hub lock — `dir` and `c.path` are plain paths, and
+        // `claudehooks::inherit` does its own file I/O with no lock
+        // involved.
         //
-        // Errors are logged and swallowed, not propagated: the worktree and
-        // its `home::record` already exist by this point, so failing the
-        // whole approve now would report a worktree creation failure for a
+        // Errors are logged and swallowed, not propagated: the worktree
+        // already exists by this point, so failing the whole approve now
+        // would report a worktree creation failure for a
         // worktree that in fact exists — the one thing CLAUDE.md's
         // destruction table is about, in its "says something untrue" form.
         // A fresh Claude started there without the hook just starts cold,
         // same as any project that never had it installed.
-        if crate::claudehooks::state_of(&dir, crate::claudehooks::Kind::Worktree)
-            == crate::claudehooks::HookState::Present
-        {
-            if let Err(e) = crate::claudehooks::set_kind(&c.path, crate::claudehooks::Kind::Worktree, true) {
-                eprintln!("roost: could not install the worktree hook into {}: {e}", c.path.display());
-            }
+        for e in crate::claudehooks::inherit(&dir, &c.path) {
+            eprintln!("roost: could not install a hook into {}: {e}", c.path.display());
         }
-        // Both hubs learn about the move before Claude does, so a
-        // `StartTerminal`/`NewTerminal` racing the reply already sees the
-        // resident. One lock at a time; never two.
+        // Both hubs refresh before Claude is told anything, so a page that
+        // loads the new worktree from `WorktreeReady` sees it as it now
+        // is. One lock at a time; never two.
         for p in [&project, &owner] {
             if let Some(arc) = open_hub(p) {
                 let mut h = Hub::lock(&arc);
@@ -3561,6 +4220,47 @@ pub fn proposal_by_id(project: &str, id: &str) -> Option<ProposalSides> {
     let arc = open_hub(project)?;
     let sides = Hub::lock(&arc).proposals.get(id).cloned();
     sides
+}
+
+/// [`Hub::rename_known_worktree`] on every open hub — whichever main
+/// checkout listed the renamed worktree. Registry, then one hub at a time,
+/// never both, like `broadcast_all`. Call with no lock held.
+pub fn rename_known_worktree(olds: &[std::path::PathBuf], new: &std::path::Path) {
+    if olds.is_empty() {
+        return;
+    }
+    let Some(reg) = REGISTRY.get() else { return };
+    let hubs: Vec<Arc<Mutex<Hub>>> = {
+        let map = reg.lock().unwrap_or_else(|e| e.into_inner());
+        map.values().cloned().collect()
+    };
+    for h in hubs {
+        Hub::lock(&h).rename_known_worktree(olds, new);
+    }
+}
+
+/// Serialises `outside::allow` process-wide. Its dedupe of a re-allowed
+/// path reads the existing records and then links a new one, so two
+/// concurrent allows of the same new path would both see "not recorded" and
+/// write two records for one directory (`outside`'s module doc leaves this
+/// to the caller). A leaf lock: held only around that one call — a few
+/// small file reads and one link, no fork, no git — and never taken with a
+/// hub or `REGISTRY` lock held, since only the off-lock work thread takes it.
+static OUTSIDE_ALLOW_LOCK: Mutex<()> = Mutex::new(());
+
+/// The cheap, fork-free half of both outside intents' validation, run
+/// under the hub lock: `parent` must be a valid project URL and must not be
+/// an outside URL itself — an outside worktree's own record would name a
+/// directory outside the roots as a parent, and `split_url` could never
+/// read such a nested URL back anyway.
+fn outside_parent_ok(parent: &str) -> Result<(), String> {
+    if !crate::session::valid_project(parent) {
+        return Err(format!("{parent:?} is not a valid project"));
+    }
+    if crate::outside::split_url(parent).is_some() {
+        return Err(format!("{parent} is itself an outside worktree; allow from its parent project"));
+    }
+    Ok(())
 }
 
 /// Send an event to every connected client of every project. Notices are
@@ -3690,6 +4390,72 @@ pub fn retab_native_if_missing(project: &str, name: &str) {
     }
     let ev = g.snapshot_event(&String::new());
     g.broadcast(&ev);
+}
+
+/// Re-homes `(home, session)` to `owner`: R16 gate, `home::record`, then
+/// refresh home and owner hubs one lock at a time and `broadcast_all`.
+/// Must be called with no hub lock held. Errors are user-facing text.
+///
+/// The one re-home path both `Hub::do_rehome`'s `Some(to)` branch and the
+/// `claudes` watcher thread (`offer_moves_at`) call — the watcher has no
+/// `ConnId` and no hub lock of its own already taken, so this reads the prior owner
+/// itself rather than trusting a value a caller computed earlier that
+/// might now be stale: a resident moved a second time leaves its
+/// *previous* owner showing a stale resident tab unless that hub, too, is
+/// refreshed — the same reasoning `do_rehome`'s own `prior_owner` existed
+/// for before this extraction.
+///
+/// `do_rehome`'s git validation (`worktree::list`, `home::owner_path`)
+/// runs before this is ever reached and is not repeated here — by the
+/// time `owner` gets here it is already known to be a worktree of `home`
+/// in the `.claude/worktrees` convention. The watcher establishes the
+/// same fact by watching the Claude it asked actually land there
+/// (`claudes::detect_moves_in` resolved it through git's own list on that
+/// tick), not by running git again.
+pub fn rehome_to(home: &str, session: &str, owner: &str) -> Result<(), String> {
+    // Read before anything is written, same as `do_rehome` used to: the
+    // owner the record names *right now*, if any. An `Unknown` record is
+    // "no prior owner" and is overwritten on the new owner's evidence —
+    // which the claudes watcher now reaches with no click at all.
+    let prior_owner = match crate::home::owner_of(home, session) {
+        crate::home::Owner::Elsewhere(o) => Some(o),
+        _ => None,
+    };
+    // R16: a resident must never shadow a native session of the same name
+    // at its new owner.
+    if crate::session::live_names(owner).contains(&session.to_string()) {
+        return Err(format!("{session} already exists in {owner}"));
+    }
+    // A previous owner's identity must not stand in for this one, even for
+    // the instant between the two writes: forgotten first, a crash there
+    // leaves a record with no `.ino` (kept or forgotten, never followed)
+    // rather than one naming `owner` with the old directory's identity.
+    crate::home::forget_identity(home, session);
+    crate::home::record(home, session, owner)?;
+    // The owner directory's identity, so a later rename of a worktree with
+    // no session of its own can still be recognised (#158 §5). Best-effort:
+    // without it a rename is forgotten by R18, exactly as before.
+    match crate::home::owner_dir(home, session, owner) {
+        Some(dir) => {
+            if let Err(e) = crate::home::record_identity(home, session, &dir) {
+                eprintln!("roost: {home}/{session} re-homed to {owner}, but its identity was not recorded: {e}");
+            }
+        }
+        None => {
+            eprintln!("roost: {home}/{session} re-homed to {owner}, whose directory did not resolve; identity not recorded");
+        }
+    }
+    // One hub lock at a time, never two: each of these opens, locks, and
+    // releases a single hub before the next one is even looked up.
+    refresh_and_broadcast(home);
+    if let Some(o) = &prior_owner {
+        if o != owner {
+            refresh_and_broadcast(o);
+        }
+    }
+    refresh_and_broadcast(owner);
+    broadcast_all(&Event::ProjectsChanged { project: home.to_string() });
+    Ok(())
 }
 
 /// Sends `ev` to one connection of one project, and says whether it could.
@@ -4245,6 +5011,59 @@ mod tests {
             .map(|n| crate::proto::Tab::Terminal { session: (*n).to_string(), home: None })
             .collect();
         w
+    }
+
+    /// Reproduced in a real container on 2026-10-29: a terminal ran a Claude
+    /// whose hook recorded it, the container restarted, the startup sweep
+    /// reaped the dead socket — and the tab came back as a fresh shell with
+    /// no resume offer. `sessions_seen` was written only by a *layout* save,
+    /// and a shell starting in an existing tab saves no layout, so nothing
+    /// ever said `term` had a shell: no state file existed at all. A host
+    /// roost restart keeps the dtach masters, so only a reboot shows this
+    /// there; in a container every restart is one.
+    ///
+    /// Driven through the real calls: `Hub::new`, then a socket appearing and
+    /// `refresh_live_sessions` — what `term.rs` does after every attach —
+    /// then a fresh `Hub::new` once the socket is gone, as after a restart.
+    ///
+    /// Revert-checked, one part at a time, each failing at its own line with
+    /// `left: []`, `right: ["term"]`: without the save in
+    /// `refresh_live_sessions`, "a shell going live is recorded on disk";
+    /// with `Hub::new` calling `refresh_live_sessions` (which saves) before
+    /// the loss is computed, "after the restart the tab is lost"; and with
+    /// `wsstate::sessions_seen` recording only the live set, "a save before
+    /// the resume keeps the loss". The first is what the container showed.
+    #[test]
+    fn a_shell_started_without_a_layout_save_is_still_lost_after_a_restart() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", d.path().join("state"));
+        let project = format!("seenonstart{}", std::process::id());
+        let sock = crate::wsstate::state_dir().join("sock").join(crate::projects::storage_key(&project));
+
+        let mut h = Hub::new(&project, d.path().to_path_buf());
+        assert!(h.ws.lost_sessions.is_empty(), "setup: a brand-new project has lost nothing");
+        std::fs::create_dir_all(&sock).unwrap();
+        std::fs::write(sock.join("term"), b"").unwrap();
+        h.refresh_live_sessions();
+        assert_eq!(h.ws.live_sessions, vec!["term".to_string()], "setup: the shell is live");
+        let (disk, _) = crate::wsstate::load(&project);
+        assert_eq!(disk.sessions_seen, vec!["term".to_string()], "a shell going live is recorded on disk");
+
+        // The restart: the shell died with the container and the sweep
+        // removed its socket.
+        std::fs::remove_file(sock.join("term")).unwrap();
+        let mut after = Hub::new(&project, d.path().to_path_buf());
+        assert_eq!(after.ws.lost_sessions, vec!["term".to_string()], "after the restart the tab is lost");
+
+        // And it stays lost across a save made before anyone resumes it, or
+        // a second restart would forget it.
+        after.persist();
+        let again = Hub::new(&project, d.path().to_path_buf());
+        assert_eq!(again.ws.lost_sessions, vec!["term".to_string()], "a save before the resume keeps the loss");
+
+        crate::session::kill_project(&project);
+        std::env::remove_var("ROOST_STATE_DIR");
     }
 
     #[test]
@@ -4863,7 +5682,7 @@ mod tests {
 
         let home_dir_of = |p: &str| (p == home).then(|| home_dir.clone());
         let announced = Mutex::new(std::collections::HashSet::new());
-        crate::claudes::sweep_gone_owners(&home_dir_of, &announced);
+        crate::claudes::sweep_gone_owners(&home_dir_of, &announced, &[]);
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut got_gone = false;
@@ -4935,7 +5754,7 @@ mod tests {
 
         let home_dir_of = |p: &str| (p == home).then(|| not_a_repo.path().to_path_buf());
         let announced = Mutex::new(std::collections::HashSet::new());
-        crate::claudes::sweep_gone_owners(&home_dir_of, &announced);
+        crate::claudes::sweep_gone_owners(&home_dir_of, &announced, &[]);
 
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(drain(&rx).iter().all(|m| !m.contains("WorktreeGone")), "git did not answer: no event must be sent");
@@ -6975,7 +7794,7 @@ mod tests {
         }
         assert!(any_process_holds(&sock), "setup: the real dtach master must be up");
         crate::home::record(&home, "term3", &owner).unwrap();
-        assert!(crate::home::resolves(&home, &owner), "setup: the owner resolves under the real roots");
+        assert!(crate::home::resolves(&home, "term3", &owner), "setup: the owner resolves under the real roots");
 
         let mut home_hub = Hub::new(&home, home_dir.clone());
         let mut owner_hub = Hub::new(&owner, owner_dir.clone());
@@ -8158,6 +8977,142 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
+    /// Two connections, deliberately — see
+    /// `open_path_refusal_reaches_only_the_client_that_asked`'s own comment
+    /// for why one subscriber cannot tell `send_to` from `broadcast`.
+    ///
+    /// A terminal link `resolve_terminal_path` refuses because it names a
+    /// file outside this project must still offer somewhere to go when
+    /// `projects::project_for_abs` can place it in a *different* roost
+    /// project (spec §3, #158) — here, `other`, found under the same
+    /// `ROOST_ROOTS` root as `self`.
+    #[test]
+    fn a_terminal_link_into_another_project_offers_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let self_dir = root.path().join("self");
+        std::fs::create_dir_all(self_dir.join(".git")).unwrap();
+        let other_dir = root.path().join("other");
+        std::fs::create_dir_all(other_dir.join(".git")).unwrap();
+        std::fs::write(other_dir.join("a.md"), "x").unwrap();
+
+        let mut h = Hub::new("self", self_dir);
+        let (asker, rx_asker) = h.subscribe();
+        let (_other_conn, rx_other_conn) = h.subscribe();
+
+        let abs = other_dir.join("a.md").canonicalize().unwrap();
+        h.handle(&asker, Intent::OpenPath { text: format!("{}:7", abs.display()) });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(
+            got.iter().any(|m| {
+                m.contains(r#""t":"PathElsewhere""#)
+                    && m.contains(r#""project":"other""#)
+                    && m.contains(r#""rel":"a.md""#)
+                    && m.contains(r#""line":7"#)
+            }),
+            "the asker should have been offered the other project: {got:?}"
+        );
+
+        // Not just "no PathElsewhere" — nothing at all, the same bar
+        // `open_path_refusal_reaches_only_the_client_that_asked` holds
+        // `PathRefused` to.
+        let others: Vec<String> = rx_other_conn.try_iter().collect();
+        assert!(
+            others.is_empty(),
+            "an elsewhere-offer must reach only the asker, got: {others:?}"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// A path outside *every* configured root (not just outside this
+    /// project) has nowhere for `projects::project_for_abs` to place it
+    /// either, so the refusal must stay the plain "outside this project"
+    /// `PathRefused` — never a `PathElsewhere` with nothing behind it.
+    #[test]
+    fn a_link_under_no_project_is_still_outside() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let self_dir = root.path().join("self");
+        std::fs::create_dir_all(&self_dir).unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("a.md"), "x").unwrap();
+
+        let mut h = Hub::new("self", self_dir);
+        let (asker, rx_asker) = h.subscribe();
+
+        let abs = outside.path().join("a.md").canonicalize().unwrap();
+        h.handle(&asker, Intent::OpenPath { text: abs.to_str().unwrap().to_string() });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"PathRefused""#) && m.contains("outside this project")),
+            "expected the existing outside-project refusal, got: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|m| m.contains("PathElsewhere")),
+            "no project should have been offered: {got:?}"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Revert-checked (Step 5): deleting the `url != self.project` guard —
+    /// so any `project_for_abs` hit becomes a `PathElsewhere`, even to this
+    /// project itself — fails this test, with the actual panic message:
+    /// `a directory inside this project must keep its existing refusal,
+    ///  got: ["{\"t\":\"PathElsewhere\",\"project\":\"self\",\"rel\":\"sub\",
+    ///  \"line\":null}"]`. Restored.
+    ///
+    /// A *literally* missing file cannot exercise this guard:
+    /// `project_for_abs` canonicalises `abs` first, so a nonexistent leaf
+    /// already answers `None` regardless of the guard (see
+    /// `terminal_abs_does_not_touch_the_filesystem`'s own doc for why that
+    /// canonicalisation lives in `project_for_abs`, not here). A directory
+    /// is the realistic case that reaches the guard with something to
+    /// check: it exists, canonicalises, and resolves to this project's own
+    /// url, while `resolve_terminal_path` still refuses it — not for being
+    /// outside anything, but for not being an openable file.
+    #[test]
+    fn a_missing_file_in_this_project_is_not_offered_as_elsewhere() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+
+        let self_dir = root.path().join("self");
+        std::fs::create_dir_all(self_dir.join(".git")).unwrap();
+        std::fs::create_dir_all(self_dir.join("sub")).unwrap();
+
+        let mut h = Hub::new("self", self_dir.clone());
+        let (asker, rx_asker) = h.subscribe();
+
+        let abs = self_dir.join("sub").canonicalize().unwrap();
+        h.handle(&asker, Intent::OpenPath { text: abs.to_str().unwrap().to_string() });
+
+        let got: Vec<String> = rx_asker.try_iter().collect();
+        assert!(
+            got.iter().any(|m| m.contains(r#""t":"PathRefused""#) && m.contains("is a directory")),
+            "a directory inside this project must keep its existing refusal, got: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|m| m.contains("PathElsewhere")),
+            "this project must never be offered as 'elsewhere' to itself, got: {got:?}"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
     /// Confinement runs before the notification ever reaches `ide::mention_to`:
     /// a path that escapes the project must be refused by `safe_resolve`
     /// itself, not silently forwarded — there being no listening Claude in
@@ -9111,6 +10066,50 @@ mod tests {
         std::env::remove_var("ROOST_STATE_DIR");
     }
 
+    /// The UI path inherits the main checkout's notification hook: before
+    /// this, only `approve_ask` mirrored anything (and only `Worktree`), so
+    /// a worktree opened from the switcher ran its Claude with no
+    /// `roost claude-hook` and never notified.
+    ///
+    /// Verified this can fail: with the `inherit` call in `do_new_worktree`
+    /// removed, the `state` assertion fails `left: Absent right: Present`.
+    /// Restored.
+    #[test]
+    fn new_worktree_inherits_the_main_checkouts_notify_hook() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        // After the commit, so the file is untracked as it is in a real
+        // checkout and `git worktree add` cannot carry it over by itself.
+        crate::claudehooks::set(&repo, true).unwrap();
+        let mut h = Hub::new("repo", repo.clone());
+        let (a, rxa) = h.subscribe();
+        drain(&rxa);
+        h.handle(&a, Intent::NewWorktree { name: Some("owl".into()), launch: None });
+        let got = rxa.try_recv().expect("clicker answered");
+        assert!(got.contains(r#""t":"WorktreeReady""#), "{got}");
+        let wt = repo.join(".claude/worktrees/worktree-owl");
+        assert!(wt.join("a.txt").is_file());
+        assert_eq!(crate::claudehooks::state(&wt), crate::claudehooks::HookState::Present);
+        assert_eq!(
+            crate::claudehooks::state_of(&wt, crate::claudehooks::Kind::Worktree),
+            crate::claudehooks::HookState::Absent,
+            "a kind the main checkout lacks is not installed"
+        );
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
     #[test]
     fn new_worktree_in_a_non_repository_is_an_error_to_the_clicker() {
         // Revert-checked: swallowing the `Err` branch in `finish` instead of
@@ -9332,6 +10331,127 @@ mod tests {
         let got = rxa.try_recv().expect("an Error must be sent");
         assert!(got.contains(r#""t":"Error""#) && got.contains("already exists"), "{got}");
         assert!(matches!(crate::home::owner_of("repo", "term"), crate::home::Owner::Here), "no record must be written");
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// `rehome_to` is the one path both `do_rehome` and the `claudes`
+    /// watcher thread call, and unlike `do_rehome` it has no
+    /// `ConnId`/hub of its own to validate against — it must apply R16
+    /// itself and refresh every affected hub before returning. Fixture
+    /// copied verbatim from `rehome_refuses_a_name_already_live_at_the_target`
+    /// (the colliding native session at the target, case 1) and
+    /// `rehome_into_a_real_worktree_of_this_project_records_the_owner`
+    /// (the plain worktree, case 2), called directly rather than through
+    /// `Intent::Rehome`.
+    ///
+    /// Revert check: commenting out the `live_names(owner)` gate inside
+    /// `rehome_to` makes case 1 fail — observed: it returns `Ok(())` and
+    /// records "term3" as a resident of the worktree instead of refusing,
+    /// shadowing the native session already there. Restored.
+    #[test]
+    fn rehome_to_refuses_a_name_already_live_in_the_owner_and_records_otherwise() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "rehometo-repo";
+        let repo = root.path().join(home);
+        std::fs::create_dir_all(&repo).unwrap();
+        for args in [&["init", "-q", "-b", "main"][..], &["config", "user.email", "t@t"], &["config", "user.name", "t"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        std::fs::write(repo.join("a.txt"), "x").unwrap();
+        for args in [&["add", "."][..], &["commit", "-qm", "init"]] {
+            assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        }
+        let wt = repo.join(".claude/worktrees/w1");
+        assert!(std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-b", "w1", wt.to_str().unwrap()])
+            .status().unwrap().success());
+        let owner = format!("{home}/.claude/worktrees/w1");
+
+        let _att_home = crate::session::reserve_and_attach(home, "term3", &repo).unwrap();
+        // Case 1: the name already exists natively at the target itself.
+        let _att_target = crate::session::reserve_and_attach(&owner, "term3", &wt).unwrap();
+
+        let err = crate::hub::rehome_to(home, "term3", &owner)
+            .expect_err("must refuse a name already live at the target");
+        assert_eq!(err, format!("term3 already exists in {owner}"), "do_rehome's own R16 text, unchanged");
+        assert!(matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Here), "no record must be written");
+
+        // Case 2: end the collision, so the name is free at the target,
+        // and register both hubs via `Hub::for_project` so the owner's
+        // `session_homes` can be checked with no sleep right after
+        // `rehome_to` returns — it must refresh the owner hub itself.
+        assert!(crate::session::end_session(&owner, "term3"), "setup: the colliding session must end");
+        let _home_hub = Hub::for_project(home, repo.clone());
+        let owner_hub = Hub::for_project(&owner, wt.clone());
+
+        crate::hub::rehome_to(home, "term3", &owner).expect("must record the move now the name is free");
+        assert!(
+            matches!(crate::home::owner_of(home, "term3"), crate::home::Owner::Elsewhere(ref o) if *o == owner),
+            "the record must now name the worktree"
+        );
+        assert_eq!(
+            Hub::lock(&owner_hub).session_homes.get("term3"),
+            Some(&home.to_string()),
+            "the owner hub's session_homes must already show term3 as a resident right after rehome_to returns"
+        );
+
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+        std::env::remove_var("ROOST_CMD");
+    }
+
+    /// A resident moved a second time, worktree to worktree, through
+    /// `rehome_to` directly — the claudes watcher's path, which has no
+    /// `do_rehome` around it to refresh anything. The *previous* owner's hub
+    /// must drop the resident before `rehome_to` returns (no sleep), or
+    /// that page keeps a tab for a terminal that now lives elsewhere.
+    ///
+    /// Revert-checked: deleting `rehome_to`'s prior-owner
+    /// `refresh_and_broadcast` fails the last assertion — observed: `left:
+    /// Some("rehometo-prior"), right: None`. Restored.
+    #[test]
+    fn rehome_to_refreshes_the_prior_owner() {
+        isolate_ide_dir_for_tests();
+        let _g1 = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g2 = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let root = tempfile::tempdir().unwrap();
+        std::env::set_var("ROOST_STATE_DIR", root.path().join("state"));
+        std::env::set_var("ROOST_ROOTS", root.path());
+        let home = "rehometo-prior";
+        let repo = root.path().join(home);
+        init_repo(&repo);
+        let mut wts = Vec::new();
+        for n in ["w1", "w2"] {
+            let wt = repo.join(format!(".claude/worktrees/{n}"));
+            assert!(std::process::Command::new("git")
+                .arg("-C").arg(&repo)
+                .args(["worktree", "add", "-q", "-b", n, wt.to_str().unwrap()])
+                .status().unwrap().success());
+            wts.push((format!("{home}/.claude/worktrees/{n}"), wt));
+        }
+        let _att = crate::session::reserve_and_attach(home, "term3", &repo).unwrap();
+        let _home_hub = Hub::for_project(home, repo.clone());
+        let w1_hub = Hub::for_project(&wts[0].0, wts[0].1.clone());
+        let w2_hub = Hub::for_project(&wts[1].0, wts[1].1.clone());
+
+        crate::hub::rehome_to(home, "term3", &wts[0].0).expect("h -> w1");
+        assert_eq!(Hub::lock(&w1_hub).session_homes.get("term3"), Some(&home.to_string()), "setup: w1 holds the resident");
+
+        crate::hub::rehome_to(home, "term3", &wts[1].0).expect("w1 -> w2");
+        assert_eq!(Hub::lock(&w2_hub).session_homes.get("term3"), Some(&home.to_string()), "w2 holds it now");
+        assert_eq!(Hub::lock(&w1_hub).session_homes.get("term3"), None, "w1 must have let go before rehome_to returned");
+
+        crate::session::kill_project(home);
         std::env::remove_var("ROOST_ROOTS");
         std::env::remove_var("ROOST_STATE_DIR");
         std::env::remove_var("ROOST_CMD");
@@ -9956,8 +11076,18 @@ mod tests {
         ask_env_clear(&[p]);
     }
 
+    /// Was `approve_creates_records_and_replies_path`. Since #158 §1 the
+    /// approval no longer re-homes: it creates the worktree, replies
+    /// `Path`, and leaves an expectation for the claudes watcher — the
+    /// record still reads `Here`.
+    ///
+    /// Revert-checked (brief step 5a): restoring `home::record` in
+    /// `approve_ask` fails — observed: `approval writes no re-home record:
+    /// Elsewhere("ask-approve/.claude/worktrees/worktree-fox")`. Removing
+    /// the `expect_move` call fails with `left: None, right:
+    /// Some("ask-approve/.claude/worktrees/worktree-fox")`. Both restored.
     #[test]
-    fn approve_creates_records_and_replies_path() {
+    fn approve_no_longer_rehomes() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
@@ -9973,8 +11103,14 @@ mod tests {
         let owner = format!("{p}/.claude/worktrees/worktree-fox");
         assert_eq!(r, AskReply::Path { path: repo.join(".claude/worktrees/worktree-fox").to_string_lossy().into() });
         assert!(
-            matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Elsewhere(o) if o == owner),
-            "the re-home record names the new worktree"
+            matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here),
+            "approval writes no re-home record: {:?}",
+            crate::home::owner_of(p, "term3")
+        );
+        assert_eq!(
+            crate::claudes::expectation_for(p, "term3"),
+            Some(owner.clone()),
+            "the watcher is told to expect term3's Claude in the new worktree"
         );
         // The clicker's `pendingTab` is navigated by `WorktreeReady`, which
         // is delivered before the `Path` reply returns — so it is queued by
@@ -10116,6 +11252,7 @@ mod tests {
         assert_eq!(t.join().unwrap(), AskReply::Refuse { refuse: "refused in roost".into() });
         assert_eq!(crate::worktree::list(&repo).len(), 1);
         assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here));
+        assert_eq!(crate::claudes::expectation_for(p, "term3"), None, "a refusal expects no move");
         ask_env_clear(&[p]);
     }
 
@@ -10168,6 +11305,7 @@ mod tests {
         let r = t.join().unwrap();
         assert!(matches!(&r, AskReply::Refuse { refuse } if refuse.contains("branch worktree-fox already exists")), "{r:?}");
         assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "no record without a worktree");
+        assert_eq!(crate::claudes::expectation_for(p, "term3"), None, "and no expected move into one");
         let got = drain(&rxa);
         assert!(got.iter().any(|m| m.contains(r#""t":"Error""#) && m.contains("already exists")), "the clicker hears why: {got:?}");
         ask_env_clear(&[p]);
@@ -10240,11 +11378,20 @@ mod tests {
         ask_env_clear(&[p]);
     }
 
-    /// R16. Revert-checked: with the gate disabled this fails with `left:
-    /// Path { path: ".../ask-r16/.claude/worktrees/worktree-fox" }` — Claude
-    /// told to move, and a second live `term3` in one owner.
+    /// Was `the_record_gate_refuses_a_name_live_in_the_owner`, whose subject
+    /// — approval refusing because R16 would refuse the re-home record — is
+    /// gone with #158 §1: approval writes no record, so it has nothing to
+    /// gate. It now asserts the opposite. The ask is approved and answered
+    /// `Path`, the record stays `Here`, and the expectation is left for the
+    /// watcher, whose `rehome_to` applies R16 when the Claude actually
+    /// arrives (`a_refused_expected_move_keeps_the_expectation_and_offers`
+    /// in claudes.rs covers what happens then).
+    ///
+    /// Revert-checked: restoring the old gate in `approve_ask` fails —
+    /// observed: `left: Refuse { refuse: "worktree-fox already has a
+    /// terminal named term3" }, right: Path { .. }`. Restored.
     #[test]
-    fn the_record_gate_refuses_a_name_live_in_the_owner() {
+    fn approval_no_longer_gates_on_a_name_live_in_the_owner() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
@@ -10261,22 +11408,25 @@ mod tests {
         let id = wait_for_ask(&rxa);
         Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
         let r = t.join().unwrap();
-        assert_eq!(r, AskReply::Refuse { refuse: "worktree-fox already has a terminal named term3".into() });
-        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "no record past the gate");
-        // Creating destroys nothing: the worktree stays.
+        assert_eq!(r, AskReply::Path { path: repo.join(".claude/worktrees/worktree-fox").to_string_lossy().into() });
+        assert!(matches!(crate::home::owner_of(p, "term3"), crate::home::Owner::Here), "approval writes no record");
+        assert_eq!(crate::claudes::expectation_for(p, "term3"), Some(owner.clone()));
         assert!(repo.join(".claude/worktrees/worktree-fox").is_dir());
         ask_env_clear(&[p, &owner]);
     }
 
-    /// Asserted in this thread straight after the reply, no sleep: the
-    /// refresh must have happened *before* `Path` was sent.
+    /// Was `approve_refreshes_the_owner_hub_before_replying`, whose subject
+    /// — the owner hub showing its new resident before Claude is told to
+    /// move — is the re-home #158 §1 removed from approval. It now asserts
+    /// the opposite, straight after the reply with no sleep: an open owner
+    /// hub has *no* resident, and the home hub still holds the terminal,
+    /// because nothing moves until the watcher sees the Claude arrive.
     ///
-    /// Revert-checked twice: removing the refresh fails with `left: None,
-    /// right: Some("ask-refresh")`; moving it to after the reply fails the
-    /// same way 5/5 runs (that variant is a race the asker almost always
-    /// wins, so it is evidence, not proof).
+    /// Revert-checked: restoring `home::record` in `approve_ask` fails —
+    /// observed: `the owner hub has no resident until the Claude is seen
+    /// there; left: Some("ask-refresh"), right: None`. Restored.
     #[test]
-    fn approve_refreshes_the_owner_hub_before_replying() {
+    fn approve_leaves_the_terminal_at_home() {
         let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let root = tempfile::tempdir().unwrap();
@@ -10295,12 +11445,12 @@ mod tests {
         assert!(matches!(t.join().unwrap(), AskReply::Path { .. }));
         assert_eq!(
             Hub::lock(&owner_hub).session_homes.get("term3"),
-            Some(&p.to_string()),
-            "the owner hub knows its resident before Claude is told to move"
+            None,
+            "the owner hub has no resident until the Claude is seen there"
         );
         assert!(
-            !Hub::lock(&hub).ws.live_sessions.contains(&"term3".to_string()),
-            "and the home hub has let go of it"
+            Hub::lock(&hub).ws.live_sessions.contains(&"term3".to_string()),
+            "and the home hub still holds it"
         );
         ask_env_clear(&[p, &owner]);
     }
@@ -10835,5 +11985,1272 @@ mod tests {
         drop(rx_a);
         assert!(!send_to_conn("send-to-conn", &a, &ev), "a closed receiver is not a delivery");
         std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    // ---- #158 §2: a worktree that appears from anywhere ----------------
+
+    fn git_ok(repo: &std::path::Path, args: &[&str]) {
+        let st = std::process::Command::new("git").arg("-C").arg(repo).args(args).output().unwrap();
+        assert!(st.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&st.stderr));
+    }
+
+    /// Every `WorktreeAppeared` on `rx`, decoded.
+    fn appeared(rx: &Receiver<String>) -> Vec<serde_json::Value> {
+        drain(rx)
+            .iter()
+            .map(|m| serde_json::from_str::<serde_json::Value>(m).unwrap())
+            .filter(|v| v["t"] == "WorktreeAppeared")
+            .collect()
+    }
+
+    fn seen(repo: &std::path::Path, root: &std::path::Path) -> Option<Vec<SeenWorktree>> {
+        seen_worktrees(crate::worktree::list(repo), &[root.to_path_buf()])
+    }
+
+    /// The motivating miss: a Claude ran a plain `git worktree add` and roost
+    /// showed nothing. Two connections, so a reply sent to one browser
+    /// instead of broadcast would fail the second half.
+    ///
+    /// Revert-checked: with `confirm_worktrees` building no event, this
+    /// fails — observed: `exactly one banner per browser: []`, `left: 0,
+    /// right: 1`. Restored.
+    #[test]
+    fn a_plain_git_worktree_add_is_announced_once() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-appear");
+        init_repo(&repo);
+        let mut h = Hub::new("wt-appear", repo.clone());
+        let (_a, rxa) = conn(&mut h);
+        let (_b, rxb) = conn(&mut h);
+        h.seed_worktrees(seen(&repo, root.path()));
+
+        git_ok(&repo, &["worktree", "add", "-q", "../sib", "-b", "sib"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        let sib = root.path().join("sib").canonicalize().unwrap();
+        for rx in [&rxa, &rxb] {
+            let got = appeared(rx);
+            assert_eq!(got.len(), 1, "exactly one banner per browser: {got:?}");
+            assert_eq!(got[0]["branch"], "sib");
+            assert_eq!(got[0]["path"], sib.to_string_lossy().as_ref());
+            assert_eq!(got[0]["url"], "sib", "a sibling under the root is a roost project");
+        }
+        // The same listing again — a second watch event for the same add.
+        h.apply_worktrees(seen(&repo, root.path()));
+        assert!(appeared(&rxa).is_empty() && appeared(&rxb).is_empty(), "announced once, not per event");
+
+        // Outside every root: still announced, with nothing to link to.
+        let far = outside.path().join("far");
+        git_ok(&repo, &["worktree", "add", "-q", far.to_str().unwrap(), "-b", "far"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        let got = appeared(&rxa);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0]["branch"], "far");
+        assert!(got[0]["url"].is_null(), "outside the roots there is no project URL: {got:?}");
+        ask_env_clear(&[]);
+    }
+
+    /// Final review M1: `git worktree move` rewrites only
+    /// `.git/worktrees/<id>/gitdir`, which the watcher ignores, so the main
+    /// checkout's known set kept A's path — and the next unrelated worktree
+    /// event announced B as having appeared. Following the rename (#158 §5)
+    /// re-points the known set; a genuinely new worktree is still announced.
+    ///
+    /// Revert-checked, run and restored: with the `rename_known_worktree`
+    /// call in `registry::follow_moves` removed, fails "a renamed worktree
+    /// is not one that appeared" — the banner for `worktree-a` (its branch)
+    /// at `.../worktree-b`.
+    #[test]
+    fn a_followed_rename_is_not_announced_as_a_new_worktree() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-renamed");
+        init_repo(&repo);
+        git_ok(&repo, &["worktree", "add", "-q", "-b", "worktree-a", ".claude/worktrees/worktree-a"]);
+        let (a, b) = ("wt-renamed/.claude/worktrees/worktree-a", "wt-renamed/.claude/worktrees/worktree-b");
+        let a_dir = repo.join(".claude/worktrees/worktree-a").canonicalize().unwrap();
+        let hub = register_for_test(Hub::new("wt-renamed", repo.clone()));
+        let (_c, rx) = conn(&mut Hub::lock(&hub));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        // What a session's attach in A leaves behind: the key's `.origin`.
+        crate::registry::record_origin(a, &a_dir);
+
+        git_ok(&repo, &["worktree", "move", ".claude/worktrees/worktree-a", ".claude/worktrees/worktree-b"]);
+        crate::registry::follow_moves(&[crate::registry::Moved {
+            old_url: a.into(),
+            new_url: b.into(),
+            live: vec![],
+            fresh: true,
+            prev: None,
+            shells: vec![],
+        }]);
+        drain(&rx);
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        let renamed = appeared(&rx);
+
+        git_ok(&repo, &["worktree", "add", "-q", "-b", "fresh", ".claude/worktrees/fresh"]);
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        let fresh = appeared(&rx);
+        ask_env_clear(&["wt-renamed"]);
+
+        assert!(renamed.is_empty(), "a renamed worktree is not one that appeared: {renamed:?}");
+        let branches: Vec<&str> = fresh.iter().filter_map(|v| v["branch"].as_str()).collect();
+        assert_eq!(branches, vec!["fresh"], "a new one still is, and only it: {fresh:?}");
+    }
+
+    /// Revert check (a): with `seed_worktrees` made a no-op, the first
+    /// confirm seeds instead and nothing is announced — observed:
+    /// `exactly the new one, never the old one: []`. Restored.
+    #[test]
+    fn a_worktree_that_existed_at_start_is_never_announced() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-start");
+        init_repo(&repo);
+        git_ok(&repo, &["worktree", "add", "-q", "../old", "-b", "old"]);
+        let mut h = Hub::new("wt-start", repo.clone());
+        let (_a, rxa) = conn(&mut h);
+        h.seed_worktrees(seen(&repo, root.path()));
+        // No confirm in between: a confirm with nothing seeded seeds by
+        // itself, which would make this test pass with the seeding gone.
+        // The first event after start is the add.
+        git_ok(&repo, &["worktree", "add", "-q", "../new", "-b", "new"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        let got = appeared(&rxa);
+        let branches: Vec<&str> = got.iter().filter_map(|v| v["branch"].as_str()).collect();
+        assert_eq!(branches, vec!["new"], "exactly the new one, never the old one: {got:?}");
+        ask_env_clear(&[]);
+    }
+
+    /// Revert check (b): with an unanswered listing read as "no worktrees"
+    /// (`seen_worktrees` returning `Some(vec![])` for an empty list), the
+    /// known set is emptied and the next real answer announces the old
+    /// worktree again — observed: `git not answering forgot nothing:
+    /// [Object {"t": String("WorktreeAppeared"), …, "branch": String("old"),
+    /// "url": String("old")}]`. Restored.
+    #[test]
+    fn an_unanswered_git_list_changes_nothing() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-silent");
+        init_repo(&repo);
+        git_ok(&repo, &["worktree", "add", "-q", "../old", "-b", "old"]);
+        let mut h = Hub::new("wt-silent", repo.clone());
+        let (_a, rxa) = conn(&mut h);
+        h.seed_worktrees(seen(&repo, root.path()));
+        // What `worktree::list` hands back when git times out or fails.
+        h.apply_worktrees(seen_worktrees(Vec::new(), &[root.path().to_path_buf()]));
+        assert!(appeared(&rxa).is_empty(), "no answer is not an event");
+        h.apply_worktrees(seen(&repo, root.path()));
+        let got = appeared(&rxa);
+        assert!(got.is_empty(), "git not answering forgot nothing: {got:?}");
+        ask_env_clear(&[]);
+    }
+
+    /// What this pins is the absence of a crash and a confirm that keeps
+    /// working after a path came and went — not much more. The first
+    /// assertion is close to unfalsifiable: `confirm_worktrees` builds
+    /// events only from the listing it is given, so no plausible revert of
+    /// it announces a path git no longer lists. It is kept because the case
+    /// is real (a `git worktree add` undone inside the debounce window) and
+    /// must not panic on the watcher's thread.
+    ///
+    /// Revert-checked on the control: with `apply_worktrees` broadcasting
+    /// nothing (`.take(0)`), the first assertion still passes and the control
+    /// fails — observed: `left: 0, right: 1`. Restored.
+    #[test]
+    fn a_worktree_added_and_removed_before_confirming_is_not_announced() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-blip");
+        init_repo(&repo);
+        let mut h = Hub::new("wt-blip", repo.clone());
+        let (_a, rxa) = conn(&mut h);
+        h.seed_worktrees(seen(&repo, root.path()));
+        git_ok(&repo, &["worktree", "add", "-q", "../blip", "-b", "blip"]);
+        git_ok(&repo, &["worktree", "remove", "../blip"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        assert!(appeared(&rxa).is_empty(), "gone by the time git was asked: nothing to open");
+        // Control: the same hub still announces a worktree that stays, so
+        // the silence above was the diff and not a dead confirm.
+        git_ok(&repo, &["worktree", "add", "-q", "../stays", "-b", "stays"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        assert_eq!(appeared(&rxa).len(), 1);
+        ask_env_clear(&[]);
+    }
+
+    /// Both of roost's own creation paths note the worktree before their
+    /// `git worktree add`; those flows open the page themselves.
+    ///
+    /// Revert-checked: with the `note_created_worktree` call removed from
+    /// `approve_ask`, this fails — observed: `roost made this one: [Object
+    /// {"t": String("WorktreeAppeared"), …, "branch":
+    /// String("worktree-fox"), …}]`. Restored.
+    #[test]
+    fn a_worktree_roost_made_is_not_announced() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "wt-made";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        let (_b, rxb) = conn(&mut Hub::lock(&hub));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        let t = spawn_ask(p, "term3", "fox");
+        let id = wait_for_ask(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::WorktreeAnswer { id, approve: true });
+        assert!(matches!(t.join().unwrap(), AskReply::Path { .. }), "the worktree was made");
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        for rx in [&rxa, &rxb] {
+            let got = appeared(rx);
+            assert!(got.is_empty(), "roost made this one: {got:?}");
+        }
+        ask_env_clear(&[p]);
+    }
+
+    /// The `+` dialog's path. Revert-checked: with the
+    /// `note_created_worktree` call removed from `do_new_worktree`, this
+    /// fails — observed: `the + dialog made this one: [Object {"t":
+    /// String("WorktreeAppeared"), …, "branch": String("worktree-bright-fox"),
+    /// …}]`. Restored.
+    #[test]
+    fn a_worktree_from_the_plus_dialog_is_not_announced() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "wt-plus";
+        let (hub, repo) = registered_hub_in_git_repo_with_session(root.path(), p, "term3");
+        let (a, rxa) = conn(&mut Hub::lock(&hub));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        Hub::lock(&hub).handle(&a, Intent::NewWorktree { name: Some("bright-fox".into()), launch: None });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let m = rxa.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())).expect("no WorktreeReady");
+            assert!(!m.contains(r#""t":"Error""#), "{m}");
+            if m.contains(r#""t":"WorktreeReady""#) {
+                break;
+            }
+        }
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        let got = appeared(&rxa);
+        assert!(got.is_empty(), "the + dialog made this one: {got:?}");
+        ask_env_clear(&[p]);
+    }
+
+    /// What the watcher calls, called with the guard held as the batch loop
+    /// does. It pins two things: the confirm does not run inline under the
+    /// caller's lock, and a thread does run it and announce.
+    ///
+    /// It does **not** pin that `git worktree list` runs off-lock inside
+    /// that thread: a thread that took the hub lock first and listed under
+    /// it would pass here just the same. That rule rests on
+    /// `worktrees_changed`'s structure (observe, then lock), not on this
+    /// test.
+    ///
+    /// Revert-checked: with `worktrees_changed` confirming inline
+    /// (`apply_worktrees(observe_worktrees(..))` then return), this fails —
+    /// observed: `assertion failed: appeared(&rxa).is_empty()`. With it
+    /// returning without spawning, it fails — observed: `the confirm thread
+    /// announced nothing: Timeout`. Both restored.
+    #[test]
+    fn worktrees_changed_confirms_on_its_own_thread() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let repo = root.path().join("wt-thread");
+        init_repo(&repo);
+        let hub = Arc::new(Mutex::new(Hub::new("wt-thread", repo.clone())));
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        git_ok(&repo, &["worktree", "add", "-q", "../sib", "-b", "sib"]);
+        {
+            let mut h = Hub::lock(&hub);
+            h.worktrees_changed(&hub);
+            // Still holding the lock: the confirm cannot have run yet.
+            assert!(appeared(&rxa).is_empty());
+        }
+        let m = rxa.recv_timeout(std::time::Duration::from_secs(20)).expect("the confirm thread announced nothing");
+        assert!(m.contains(r#""t":"WorktreeAppeared""#) && m.contains(r#""branch":"sib""#), "{m}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Hub::lock(&hub).worktrees_confirming {
+            assert!(std::time::Instant::now() < deadline, "the confirm thread never finished");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ask_env_clear(&[]);
+    }
+
+    // ---- #188 Task 3: allow / revoke one outside worktree -----------------
+
+    /// A git repo `project` directly under a root, and a worktree of it
+    /// (`<outside>/<wt_name>`, branch `side`) under a second tempdir that is
+    /// under no root at all. State lives in a third tempdir. The caller holds
+    /// both env locks (STATE_ENV_LOCK, then SESSION_ENV_LOCK).
+    struct OutsideFix {
+        _root: tempfile::TempDir,
+        _outside: tempfile::TempDir,
+        _state: tempfile::TempDir,
+        project: String,
+        repo: std::path::PathBuf,
+        outside_dir: std::path::PathBuf,
+        wt: std::path::PathBuf,
+        /// Hubs this test put in `REGISTRY`, unregistered on drop.
+        registered: Vec<String>,
+        /// A `.git` this test made unreadable, restored on drop.
+        muted: Option<std::path::PathBuf>,
+    }
+
+    impl OutsideFix {
+        fn register(&mut self, hub: Hub) -> Arc<Mutex<Hub>> {
+            self.registered.push(hub.project.clone());
+            register_for_test(hub)
+        }
+
+        fn mute_git(&mut self) -> std::path::PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let git_dir = self.repo.join(".git");
+            self.muted = Some(git_dir.clone());
+            std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+            git_dir
+        }
+
+        fn unmute_git(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(d) = self.muted.take() {
+                let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+
+        /// A real roost-shaped git worktree of the parent, inside the roots:
+        /// `<project>/.claude/worktrees/worktree-x`, branch `x`. Returns its
+        /// URL and directory, asserting the URL resolves.
+        fn add_sibling(&self) -> (String, std::path::PathBuf) {
+            let sib = format!("{}/.claude/worktrees/worktree-x", self.project);
+            let sib_dir = self.repo.join(".claude/worktrees/worktree-x");
+            let st = std::process::Command::new("git")
+                .arg("-C").arg(&self.repo)
+                .args(["worktree", "add", "-q"]).arg(&sib_dir).args(["-b", "x"])
+                .status().unwrap();
+            assert!(st.success(), "setup: the sibling worktree");
+            assert!(
+                crate::projects::resolve_project(&crate::projects::roots(), &sib).is_some(),
+                "setup: the sibling page's own URL must resolve"
+            );
+            (sib, sib_dir)
+        }
+    }
+
+    /// Cleanup on every exit, a timed-out wait's panic included: a `.git`
+    /// left at 000, a hub left in `REGISTRY` or the env left pointing at a
+    /// deleted tempdir would each leak into whichever test runs next. Runs
+    /// before the tempdir fields drop, so the permission restore lets them
+    /// delete.
+    ///
+    /// Revert-checked: a panic injected right after the wait in
+    /// `allow_refuses_when_git_does_not_answer` left no tempdir behind; with
+    /// the guard's `muted` cleared first (as with no guard), the same panic
+    /// left `<tmp>/orepo-mute/.git` at `d---------` and the tempdir undeleted.
+    impl Drop for OutsideFix {
+        fn drop(&mut self) {
+            self.unmute_git();
+            for p in &self.registered {
+                unregister_for_test(p);
+            }
+            outside_env_clear();
+        }
+    }
+
+    fn outside_fixture(project: &str, wt_name: &str) -> OutsideFix {
+        isolate_ide_dir_for_tests();
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let root_c = root.path().canonicalize().unwrap();
+        let outside_dir = outside.path().canonicalize().unwrap();
+        std::env::set_var("ROOST_ROOTS", &root_c);
+        std::env::set_var("ROOST_STATE_DIR", state.path());
+        let repo = root_c.join(project);
+        init_repo(&repo);
+        let wt = outside_dir.join(wt_name);
+        let st = std::process::Command::new("git")
+            .arg("-C").arg(&repo)
+            .args(["worktree", "add", "-q"]).arg(&wt).args(["-b", "side"])
+            .status().unwrap();
+        assert!(st.success(), "setup: git worktree add outside the roots");
+        assert!(
+            !crate::projects::roots().iter().any(|r| wt.starts_with(r)),
+            "setup: the worktree must be under no root, or this tests nothing"
+        );
+        OutsideFix {
+            _root: root,
+            _outside: outside,
+            _state: state,
+            project: project.into(),
+            repo,
+            outside_dir,
+            wt,
+            registered: Vec::new(),
+            muted: None,
+        }
+    }
+
+    fn outside_env_clear() {
+        std::env::remove_var("ROOST_ROOTS");
+        std::env::remove_var("ROOST_STATE_DIR");
+    }
+
+    /// Every message up to and including the first containing `needle`, or
+    /// panics after 20 s with what did arrive. The work runs on a spawned
+    /// thread for a registered hub, so the reply is asynchronous.
+    fn await_containing(rx: &Receiver<String>, needle: &str) -> (String, Vec<String>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut seen = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(m) if m.contains(needle) => return (m, seen),
+                Ok(m) => seen.push(m),
+                Err(_) => panic!("timed out waiting for {needle}; got {seen:?}"),
+            }
+        }
+    }
+
+    /// The record files on disk for `project` — read directly, not through
+    /// `outside::list` (which skips damaged records), so "no record" means
+    /// nothing at all was written. A directory that cannot be read panics:
+    /// "could not look" must not pass as "nothing there".
+    fn outside_records_on_disk(project: &str) -> Vec<String> {
+        let dir = crate::wsstate::state_dir().join("outside").join(crate::projects::storage_key(project));
+        match std::fs::read_dir(&dir) {
+            Ok(rd) => rd.map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => panic!("cannot read {}: {e}", dir.display()),
+        }
+    }
+
+    /// Spec §1 "Allow", and the privacy of the reply: `OutsideAllowed` goes
+    /// to the clicker only, while every other browser learns of the change
+    /// from `ProjectsChanged`. Two connections, so `send_to` and `broadcast`
+    /// are distinguishable.
+    ///
+    /// Revert-checked: with `send_to` in the reply replaced by `broadcast`,
+    /// fails on "the other connection must not get OutsideAllowed". With the
+    /// `outside::allow` call skipped (the url still minted and replied), fails
+    /// on "the virtual URL must resolve to the real worktree" (left: None).
+    #[test]
+    fn allow_writes_the_record_and_the_url_resolves() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-allow", "wt");
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        let (_b, rxb) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        drain(&rxb);
+        Hub::lock(&hub).handle(
+            &a,
+            Intent::AllowOutsideWorktree { parent: fx.project.clone(), path: fx.wt.display().to_string() },
+        );
+        let (got, _) = await_containing(&rxa, r#""t":"OutsideAllowed""#);
+        let url = crate::outside::url_for(&fx.project, "wt");
+        // The reply is sent last, after both broadcasts, so by now the other
+        // connection's queue already holds everything it will ever get.
+        let other = drain(&rxb);
+        let resolved = crate::projects::resolve_project(&crate::projects::roots(), &url);
+        assert!(got.contains(&format!(r#""url":"{url}""#)), "{got}");
+        assert!(!other.iter().any(|m| m.contains("OutsideAllowed")), "the other connection must not get OutsideAllowed: {other:?}");
+        assert!(
+            other.iter().any(|m| m.contains(r#""t":"ProjectsChanged""#)),
+            "the other connection must hear the change: {other:?}"
+        );
+        assert_eq!(resolved, Some(fx.wt.clone()), "the virtual URL must resolve to the real worktree");
+    }
+
+    /// Spec §1: git's own listing of `path` as a worktree of `parent` is the
+    /// evidence an allow rests on. A plain directory outside the roots —
+    /// everything `outside::allow` itself checks holds for it — is refused,
+    /// and nothing is written.
+    ///
+    /// Revert-checked (a): with the listing match skipped (the `!is_listed`
+    /// refusal removed), fails: `expected a refusal, got
+    /// {"t":"OutsideAllowed","url":"orepo-unlisted/.claude/outside/plain"}`.
+    #[test]
+    fn allow_refuses_a_path_git_does_not_list() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-unlisted", "wt");
+        let plain = fx.outside_dir.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(
+            &a,
+            Intent::AllowOutsideWorktree { parent: fx.project.clone(), path: plain.display().to_string() },
+        );
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
+        let records = outside_records_on_disk(&fx.project);
+        assert!(got.contains(r#""t":"Error""#), "expected a refusal, got {got}");
+        assert!(
+            got.contains(&format!("{} is not a worktree of {}", plain.display(), fx.project)),
+            "the refusal names the path and the parent: {got}"
+        );
+        assert!(records.is_empty(), "a refusal writes nothing: {records:?}");
+    }
+
+    /// The first message containing any of `needles`.
+    fn await_any_of(rx: &Receiver<String>, needles: &[&str]) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut seen = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(m) if needles.iter().any(|n| m.contains(n)) => return m,
+                Ok(m) => seen.push(m),
+                Err(_) => panic!("timed out waiting for any of {needles:?}; got {seen:?}"),
+            }
+        }
+    }
+
+    /// Spec §1: "An empty list is git not answering: refuse, writing
+    /// nothing." A repository whose `.git` cannot be read lists nothing —
+    /// which is not evidence that `path` is not a worktree, and must not be
+    /// worded as if it were.
+    ///
+    /// Revert-checked (b, ruling 1): with the empty-listing refusal removed
+    /// (an empty listing let through to the match), fails on the message
+    /// assertion: the refusal became `... is not a worktree of
+    /// orepo-mute` instead of "git did not answer; nothing was allowed".
+    #[test]
+    fn allow_refuses_when_git_does_not_answer() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("running as root: an unreadable .git is still readable; skipping");
+            return;
+        }
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-mute", "wt");
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        fx.mute_git();
+        let listed = crate::worktree::list(&fx.repo);
+        Hub::lock(&hub).handle(
+            &a,
+            Intent::AllowOutsideWorktree { parent: fx.project.clone(), path: fx.wt.display().to_string() },
+        );
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
+        fx.unmute_git();
+        let records = outside_records_on_disk(&fx.project);
+        assert!(listed.is_empty(), "setup: git must not answer through an unreadable .git ({} listed)", listed.len());
+        assert!(got.contains("git did not answer; nothing was allowed"), "{got}");
+        assert!(records.is_empty(), "a refusal writes nothing: {records:?}");
+    }
+
+    /// Spec §1 / Review Focus 4: `parent` is carried explicitly because the
+    /// switcher is in every page's header. A sibling worktree's page asking
+    /// for the parent's outside worktree records it under the *named* parent,
+    /// never under the page that sent it.
+    ///
+    /// Revert-checked: with the work using the sending hub's own `project`
+    /// instead of `parent`, fails on the url assertion. Before fix round 1
+    /// the reply was
+    /// `{"t":"OutsideAllowed","url":"orepo-sib/.claude/worktrees/worktree-x/.claude/outside/wt"}`
+    /// (git lists the outside worktree from the sibling's checkout too); since
+    /// the main-checkout refusal it is
+    /// `{"t":"Error","msg":"orepo-sib/.claude/worktrees/worktree-x is not the repository's main checkout; allow it from orepo-sib"}`.
+    #[test]
+    fn allow_from_a_sibling_page_uses_the_named_parent() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-sib", "wt");
+        // A real git worktree of the parent, so the sibling's own URL
+        // resolves too — otherwise a hub that wrongly used its own project
+        // would fail on "does not resolve" and never reach the record write
+        // this test exists to place.
+        let (sib, sib_dir) = fx.add_sibling();
+        let hub = fx.register(Hub::new(&sib, sib_dir.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(
+            &a,
+            Intent::AllowOutsideWorktree { parent: fx.project.clone(), path: fx.wt.display().to_string() },
+        );
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
+        let at_parent = outside_records_on_disk(&fx.project);
+        let at_sib = outside_records_on_disk(&sib);
+        let url = crate::outside::url_for(&fx.project, "wt");
+        assert!(got.contains(&format!(r#""url":"{url}""#)), "{got}");
+        assert_eq!(at_parent, vec!["wt".to_string()]);
+        assert!(at_sib.is_empty(), "nothing is recorded under the sending page: {at_sib:?}");
+    }
+
+    /// Fix round 1, item 1(a): a worktree already under the roots has a
+    /// project key of its own. Allowing it too would give one directory two
+    /// keys — sessions, buffers, Close Project and overview rows split
+    /// between them. git lists it as a non-main worktree, so only the
+    /// in-roots refusal stands between it and a record.
+    ///
+    /// Revert-checked: with the `project_for_abs` refusal removed, fails on
+    /// "the refusal says where it already opens", got
+    /// `{"t":"OutsideAllowed","url":"orepo-inroots/.claude/outside/worktree-x"}`.
+    #[test]
+    fn allow_refuses_a_worktree_already_under_the_roots() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-inroots", "wt");
+        let (sib, sib_dir) = fx.add_sibling();
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(
+            &a,
+            Intent::AllowOutsideWorktree { parent: fx.project.clone(), path: sib_dir.display().to_string() },
+        );
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
+        let records = outside_records_on_disk(&fx.project);
+        assert!(
+            got.contains("already under roost's roots") && got.contains(&format!("open it at {sib}")),
+            "the refusal says where it already opens: {got}"
+        );
+        assert!(records.is_empty(), "a refusal writes nothing: {records:?}");
+    }
+
+    /// Fix round 1, item 1(b): `parent` must be the repository's main
+    /// checkout. git lists every worktree from any of them, so a sibling
+    /// worktree named as `parent` passes the listing check — and the record
+    /// would land under the sibling's key, a second key for the same
+    /// directory that the parent's prune never sees. The *sender* may be a
+    /// sibling's page (`allow_from_a_sibling_page_uses_the_named_parent`);
+    /// the named parent may not.
+    ///
+    /// Revert-checked: with the main-checkout refusal removed, fails on
+    /// "the refusal names the main checkout", got
+    /// `{"t":"OutsideAllowed","url":"orepo-notmain/.claude/worktrees/worktree-x/.claude/outside/wt"}`.
+    #[test]
+    fn allow_refuses_a_parent_that_is_not_the_main_checkout() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-notmain", "wt");
+        let (sib, sib_dir) = fx.add_sibling();
+        let hub = fx.register(Hub::new(&sib, sib_dir.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(
+            &a,
+            Intent::AllowOutsideWorktree { parent: sib.clone(), path: fx.wt.display().to_string() },
+        );
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
+        let at_sib = outside_records_on_disk(&sib);
+        let at_parent = outside_records_on_disk(&fx.project);
+        assert!(
+            got.contains(&format!("{sib} is not the repository's main checkout; allow it from {}", fx.project)),
+            "the refusal names the main checkout: {got}"
+        );
+        assert!(at_sib.is_empty() && at_parent.is_empty(), "a refusal writes nothing: {at_sib:?} {at_parent:?}");
+    }
+
+    /// The deferred fallback from Task 1, settled by the final review: a
+    /// basename `wtname::check` refuses (`_wt`, leading `_`) is sanitised
+    /// into a name, not refused — renaming the directory would break the
+    /// path of the Claude already working there, so a refusal left the user
+    /// no way in. The clicker gets `OutsideAllowed` at the sanitised URL.
+    ///
+    /// Revert-checked: with `outside::name_base` replaced by the raw
+    /// basename (cp backup, restored), fails on `expected an allow, got
+    /// {"t":"Error","msg":"cannot allow …/_wt: worktree name \"_wt\" must
+    /// match ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$"}`.
+    #[test]
+    fn allow_sanitises_a_basename_wtname_refuses() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-badname", "_wt");
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(
+            &a,
+            Intent::AllowOutsideWorktree { parent: fx.project.clone(), path: fx.wt.display().to_string() },
+        );
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, "OutsideAllowed"]);
+        let records = outside_records_on_disk(&fx.project);
+        let want = format!(r#"{{"t":"OutsideAllowed","url":"{}/.claude/outside/wt"}}"#, fx.project);
+        assert_eq!(got, want, "expected an allow, got {got}");
+        assert_eq!(records, vec!["wt".to_string()], "one record, under the sanitised name");
+        assert_eq!(
+            crate::projects::resolve_project(&crate::projects::roots(), &format!("{}/.claude/outside/wt", fx.project)),
+            Some(fx.wt.clone()),
+            "the sanitised URL resolves to the real directory"
+        );
+    }
+
+    /// Spec §1 "Revocation": `RevokeOutsideWorktree` deletes the record, the
+    /// virtual URL stops resolving, and every browser hears the change.
+    ///
+    /// Revert-checked: with the `outside::revoke` call replaced by only its
+    /// name check, fails on `the record is gone: ["wt"]`.
+    #[test]
+    fn revoke_deletes_the_record() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-revoke", "wt");
+        crate::outside::allow(&fx.project, &fx.wt).unwrap();
+        let url = crate::outside::url_for(&fx.project, "wt");
+        let before = crate::projects::resolve_project(&crate::projects::roots(), &url);
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::RevokeOutsideWorktree { parent: fx.project.clone(), name: "wt".into() });
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, r#""t":"ProjectsChanged""#]);
+        let records = outside_records_on_disk(&fx.project);
+        let after = crate::projects::resolve_project(&crate::projects::roots(), &url);
+        // A malformed name is refused with a message, not silently ignored.
+        Hub::lock(&hub).handle(&a, Intent::RevokeOutsideWorktree { parent: fx.project.clone(), name: "../x".into() });
+        let bad = await_any_of(&rxa, &[r#""t":"Error""#, r#""t":"ProjectsChanged""#]);
+        assert_eq!(before, Some(fx.wt.clone()), "setup: the record must resolve before the revoke");
+        assert!(got.contains("ProjectsChanged"), "{got}");
+        assert!(records.is_empty(), "the record is gone: {records:?}");
+        assert_eq!(after, None);
+        assert!(bad.contains(r#""t":"Error""#) && bad.contains("invalid worktree name"), "{bad}");
+    }
+
+    /// The overview's revoke used to resolve on any `ProjectsChanged` for
+    /// the parent, which a terminal spawn or a prune also sends, so it could
+    /// report success and hide a later `Error`. `OutsideRevoked` is the
+    /// clicker's own answer: sent to it alone, naming what was revoked,
+    /// after the broadcast. Two connections, so `send_to` and `broadcast`
+    /// are distinguishable; the other one hearing `ProjectsChanged` is what
+    /// shows its queue was live.
+    ///
+    /// Revert-checked (cp backup, restored): with the work closure's reply
+    /// back to `Ok(None)`, fails `timed out waiting for
+    /// "t":"OutsideRevoked"; got [{"t":"State",…}, …]`; with `send_to` in
+    /// `run_outside`'s reply replaced by `broadcast`, fails `the other
+    /// connection must not get OutsideRevoked: [… {"t":"OutsideRevoked",
+    /// "parent":"orepo-revack","name":"wt"}]`.
+    #[test]
+    fn revoke_answers_the_clicker_alone_with_outside_revoked() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-revack", "wt");
+        crate::outside::allow(&fx.project, &fx.wt).unwrap();
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        let (_b, rxb) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        drain(&rxb);
+        Hub::lock(&hub).handle(&a, Intent::RevokeOutsideWorktree { parent: fx.project.clone(), name: "wt".into() });
+        let (got, _) = await_containing(&rxa, r#""t":"OutsideRevoked""#);
+        // The reply is sent last, after the broadcasts, so by now the other
+        // connection's queue holds everything it will get.
+        let other = drain(&rxb);
+        assert_eq!(got, format!(r#"{{"t":"OutsideRevoked","parent":"{}","name":"wt"}}"#, fx.project));
+        assert!(!other.iter().any(|m| m.contains("OutsideRevoked")), "the other connection must not get OutsideRevoked: {other:?}");
+        assert!(
+            other.iter().any(|m| m.contains(r#""t":"ProjectsChanged""#)),
+            "the other connection must hear the change: {other:?}"
+        );
+    }
+
+    /// Spec §1 "Revocation never touches sessions" / Review Focus 5: a live
+    /// terminal started on the outside page — real dtach, its cwd inside the
+    /// outside directory — survives the revoke, while the page stops
+    /// resolving. "Survives" is asserted twice: roost still counts it live
+    /// (`live_names`), and the very process that held the socket before the
+    /// revoke is still running.
+    ///
+    /// Revert-checked: with `crate::session::kill_project(&url)` added to the
+    /// revoke work after `outside::revoke`, fails: "a revoke must leave the
+    /// session's processes running; gone: [<master pid>] of [<master>,
+    /// <client>]". A first draft asserted only "some process's argv names
+    /// the socket" and stayed green under that same sabotage — the attach
+    /// client, still exiting, still matched — which is why the holders' own
+    /// pids are pinned below.
+    #[test]
+    fn revoke_leaves_a_live_session_alive() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ROOST_CMD"); // real dtach: "alive" is the socket's holder
+        let mut fx = outside_fixture("orepo-live", "wt");
+        crate::outside::allow(&fx.project, &fx.wt).unwrap();
+        let url = crate::outside::url_for(&fx.project, "wt");
+        let dir = crate::projects::resolve_project(&crate::projects::roots(), &url)
+            .expect("setup: the virtual URL must resolve before the revoke");
+        let att = crate::session::reserve_and_attach(&url, "term1", &dir)
+            .unwrap_or_else(|e| panic!("dtach is a runtime prerequisite of this test: {e}"));
+        let sock = crate::session::socket_path(&url, "term1");
+        // Ends this test's own shell on every exit, a panicking wait
+        // included — the RED run of this test (no handler yet, so the wait
+        // timed out) leaked exactly that shell before this guard existed.
+        struct EndOnDrop(std::path::PathBuf);
+        impl Drop for EndOnDrop {
+            fn drop(&mut self) {
+                let _ = crate::registry::kill_and_unlink(&self.0);
+            }
+        }
+        let _end = EndOnDrop(sock.clone());
+        drop(att);
+        // Every process naming the socket — the detached master and roost's
+        // own attach client — pinned by pid, so "alive afterwards" is about
+        // these processes and not about whatever argv matches by then.
+        let holders = || {
+            let snap = crate::registry::holders_snapshot().expect("the process listing must be readable");
+            crate::registry::pids_holding_path(&snap, &sock)
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut before = holders();
+        while before.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            before = holders();
+        }
+        // Running, not merely present: a killed child sits in /proc as a
+        // zombie until reaped.
+        let running = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|st| st.rsplit_once(')').map(|(_, rest)| rest.trim_start().chars().next() != Some('Z')))
+                .unwrap_or(false)
+        };
+        let live_before = crate::session::live_names(&url);
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        let (a, rxa) = Hub::lock(&hub).subscribe();
+        drain(&rxa);
+        Hub::lock(&hub).handle(&a, Intent::RevokeOutsideWorktree { parent: fx.project.clone(), name: "wt".into() });
+        let got = await_any_of(&rxa, &[r#""t":"Error""#, r#""t":"ProjectsChanged""#]);
+        let live_after = crate::session::live_names(&url);
+        let dead: Vec<u32> = before.iter().copied().filter(|p| !running(*p)).collect();
+        let after = crate::projects::resolve_project(&crate::projects::roots(), &url);
+        // Cleanup before asserting, so a failure does not leak a shell. Only
+        // this test's own socket's holders — never a broad pkill.
+        drop(_end);
+        assert!(!before.is_empty(), "setup: the real dtach master must be up");
+        assert_eq!(live_before, vec!["term1".to_string()], "setup: roost must count the session live");
+        assert!(got.contains("ProjectsChanged"), "{got}");
+        assert_eq!(live_after, vec!["term1".to_string()], "roost must still count the session live");
+        assert!(dead.is_empty(), "a revoke must leave the session's processes running; gone: {dead:?} of {before:?}");
+        assert_eq!(after, None, "and the page stops resolving");
+    }
+
+    // ---- #188 Task 5: the appeared list persists ------------------------
+
+    /// The `appeared` list of every `State` on `rx`, oldest first.
+    fn appeared_states(rx: &Receiver<String>) -> Vec<Vec<serde_json::Value>> {
+        drain(rx)
+            .iter()
+            .map(|m| serde_json::from_str::<serde_json::Value>(m).unwrap())
+            .filter(|v| v["t"] == "State")
+            .map(|v| v["ws"]["appeared"].as_array().cloned().unwrap_or_default())
+            .collect()
+    }
+
+    /// What `wsconn` does for a connection to `url` at `dir`, minus the
+    /// thread: find the parent, and clear only if there is one.
+    fn open_page(url: &str, dir: &std::path::Path) {
+        if let Some(parent) = worktree_parent(url, dir) {
+            clear_appeared_on_open(&parent, dir);
+        }
+    }
+
+    fn snapshot_appeared(h: &mut Hub) -> Vec<serde_json::Value> {
+        let m = crate::proto::encode(&h.snapshot_event(&String::new()));
+        let v: serde_json::Value = serde_json::from_str(&m).unwrap();
+        v["ws"]["appeared"].as_array().cloned().expect("State carries appeared")
+    }
+
+    /// A hub that has seen `sib` (a sibling worktree under the root, branch
+    /// `sib`) appear. Returns the repo and `sib`'s canonical path.
+    fn hub_with_an_appearance(root: &std::path::Path, project: &str) -> (Hub, std::path::PathBuf, std::path::PathBuf) {
+        let repo = root.join(project);
+        init_repo(&repo);
+        let mut h = Hub::new(project, repo.clone());
+        h.seed_worktrees(seen(&repo, root));
+        let sib_rel = format!("../{project}-sib");
+        git_ok(&repo, &["worktree", "add", "-q", &sib_rel, "-b", "sib"]);
+        h.apply_worktrees(seen(&repo, root));
+        let sib = root.join(format!("{project}-sib")).canonicalize().unwrap();
+        (h, repo, sib)
+    }
+
+    /// The point of the task: a page that connects after the event — here a
+    /// fresh `Hub`, which is what a restart builds — still has the banner.
+    ///
+    /// Revert check (a), run and restored: with the `appeared::add` call in
+    /// `confirm_worktrees` removed, fails — observed: `a new hub still has
+    /// it: []`, `left: 0, right: 1`.
+    #[test]
+    fn an_appearance_survives_a_new_hub() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let (h, repo, sib) = hub_with_an_appearance(root.path(), "ap-survive");
+        drop(h);
+        let mut fresh = Hub::new("ap-survive", repo);
+        let got = snapshot_appeared(&mut fresh);
+        ask_env_clear(&[]);
+        assert_eq!(got.len(), 1, "a new hub still has it: {got:?}");
+        assert_eq!(got[0]["path"], sib.to_string_lossy().as_ref());
+        assert_eq!(got[0]["branch"], "sib");
+        assert_eq!(got[0]["url"], "ap-survive-sib", "under the root it links to its project");
+        assert_eq!(got[0]["outside"], false);
+        assert_eq!(got[0]["allowed"], false);
+    }
+
+    /// Two connections, so a dismissal answered to the clicker alone cannot
+    /// pass: the other tab must lose the banner too.
+    ///
+    /// Revert check (b), run and restored: with the `DismissAppeared` arm
+    /// sending the snapshot to `from` only (`send_to` in place of
+    /// `dismiss_appeared`'s `broadcast`), fails — observed: `the other
+    /// connection hears of it too: []`, `left: None, right: Some(0)`.
+    #[test]
+    fn dismiss_clears_it_for_every_connection() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let (mut h, repo, sib) = hub_with_an_appearance(root.path(), "ap-dismiss");
+        let (a, rxa) = conn(&mut h);
+        let (_b, rxb) = conn(&mut h);
+        h.handle(&a, Intent::DismissAppeared { path: sib.to_string_lossy().into_owned() });
+        let (sa, sb) = (appeared_states(&rxa), appeared_states(&rxb));
+        let on_disk = crate::appeared::load("ap-dismiss");
+        let fresh = snapshot_appeared(&mut Hub::new("ap-dismiss", repo));
+        ask_env_clear(&[]);
+        assert_eq!(sa.last().map(Vec::len), Some(0), "the clicker's banner is gone: {sa:?}");
+        assert_eq!(sb.last().map(Vec::len), Some(0), "the other connection hears of it too: {sb:?}");
+        assert!(on_disk.is_empty(), "and it is gone for good: {on_disk:?}");
+        assert!(fresh.is_empty(), "a later page does not see it either: {fresh:?}");
+    }
+
+    /// Opening the worktree's own page is the user seeing it (§3). The
+    /// parent's browsers learn of it; an unrelated page clears nothing.
+    ///
+    /// Revert-checked, run and restored: with `clear_appeared_on_open`
+    /// returning at once, fails — observed: `the parent's browsers lose the
+    /// banner: []`, `left: None, right: Some(0)` (no State at all). With
+    /// `worktree_parent`'s `.claude/worktrees/` arm made unmatchable it
+    /// fails on the decoy instead — observed: `another page's open clears
+    /// nothing`, `left: ([[]], 0), right: ([], 1)`: the `.git` fallback then
+    /// finds the real parent from the decoy's directory. The URL arms
+    /// themselves are pinned by `worktree_parent_reads_both_url_shapes`.
+    #[test]
+    fn opening_the_worktree_page_clears_its_entry() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ap-open";
+        let repo = root.path().join(p);
+        init_repo(&repo);
+        let hub = register_for_test(Hub::new(p, repo.clone()));
+        Hub::lock(&hub).seed_worktrees(seen(&repo, root.path()));
+        git_ok(&repo, &["worktree", "add", "-q", "-b", "x", ".claude/worktrees/worktree-x"]);
+        Hub::lock(&hub).apply_worktrees(seen(&repo, root.path()));
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        let (_b, rxb) = conn(&mut Hub::lock(&hub));
+        let wt = repo.join(".claude/worktrees/worktree-x");
+        // Not a worktree page of this parent: nothing changes.
+        open_page(p, &repo);
+        open_page("ap-open-other/.claude/worktrees/worktree-x", &wt);
+        let untouched = (appeared_states(&rxa), crate::appeared::load(p).len());
+        open_page(&format!("{p}/.claude/worktrees/worktree-x"), &wt);
+        let (sa, sb) = (appeared_states(&rxa), appeared_states(&rxb));
+        let on_disk = crate::appeared::load(p);
+        ask_env_clear(&[p]);
+        assert_eq!(untouched, (vec![], 1), "another page's open clears nothing");
+        assert_eq!(sa.last().map(Vec::len), Some(0), "the parent's browsers lose the banner: {sa:?}");
+        assert_eq!(sb.last().map(Vec::len), Some(0), "every one of them: {sb:?}");
+        assert!(on_disk.is_empty(), "{on_disk:?}");
+    }
+
+    /// The outside shape end to end: shown as outside and not allowed, then
+    /// allowed with its virtual URL, then cleared by opening that URL.
+    ///
+    /// Revert-checked, run and restored: with `appeared_view` leaving `url`
+    /// `None` for an allowed outside entry, fails — observed: `left: Null,
+    /// right: "orepo-ap/.claude/outside/wt"`. Before fix round 1, with
+    /// `worktree_parent`'s `split_url` arm made unmatchable this failed on
+    /// "opening the virtual URL clears it"; since the `.git` fallback, the
+    /// same revert passes here (the outside worktree's `.git` names its
+    /// main checkout too), so that arm is pinned by
+    /// `worktree_parent_reads_both_url_shapes` instead.
+    #[test]
+    fn an_outside_appearance_is_viewed_and_cleared_by_its_virtual_url() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-ap", "wt");
+        // The fixture already made the worktree; forget it, so the next
+        // confirm sees it as new.
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        Hub::lock(&hub).seed_worktrees(Some(Vec::new()));
+        let root = crate::projects::roots()[0].clone();
+        Hub::lock(&hub).apply_worktrees(seen(&fx.repo, &root));
+        let before = snapshot_appeared(&mut Hub::lock(&hub));
+        assert_eq!(before.len(), 1, "{before:?}");
+        assert_eq!(before[0]["path"], fx.wt.to_string_lossy().as_ref());
+        assert_eq!((&before[0]["outside"], &before[0]["allowed"]), (&serde_json::json!(true), &serde_json::json!(false)));
+        assert!(before[0]["url"].is_null(), "not allowed: nowhere to link: {before:?}");
+
+        crate::outside::allow(&fx.project, &fx.wt).unwrap();
+        let allowed = snapshot_appeared(&mut Hub::lock(&hub));
+        let url = crate::outside::url_for(&fx.project, "wt");
+        assert_eq!(allowed[0]["allowed"], true, "{allowed:?}");
+        assert_eq!(allowed[0]["url"], url.as_str());
+
+        open_page(&url, &fx.wt);
+        let after = snapshot_appeared(&mut Hub::lock(&hub));
+        assert!(after.is_empty(), "opening the virtual URL clears it: {after:?}");
+    }
+
+    /// A non-empty answer without it clears it — including the "only main"
+    /// answer left after removing the last worktree — and no answer clears
+    /// nothing.
+    ///
+    /// Revert-checked, run and restored: with the `retain_listed` call
+    /// removed from `confirm_worktrees`, fails — observed: `a listing
+    /// without it clears it: []`, `left: None, right: Some(0)` (nothing
+    /// changed, so no State went out). With the main checkout left out of
+    /// `listed`, fails with the same observation: "only main" is then an
+    /// empty listing, which both callees refuse to act on.
+    #[test]
+    fn a_listing_without_it_clears_it() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let (mut h, repo, _sib) = hub_with_an_appearance(root.path(), "ap-gone");
+        let (_a, rxa) = conn(&mut h);
+        h.apply_worktrees(seen_worktrees(Vec::new(), &[root.path().to_path_buf()]));
+        let unanswered = (appeared_states(&rxa), crate::appeared::load("ap-gone").len());
+        git_ok(&repo, &["worktree", "remove", "../ap-gone-sib"]);
+        h.apply_worktrees(seen(&repo, root.path()));
+        let states = appeared_states(&rxa);
+        let on_disk = crate::appeared::load("ap-gone");
+        ask_env_clear(&[]);
+        assert_eq!(unanswered, (vec![], 1), "git not answering clears nothing");
+        assert_eq!(states.last().map(Vec::len), Some(0), "a listing without it clears it: {states:?}");
+        assert!(on_disk.is_empty(), "{on_disk:?}");
+    }
+
+    // ---- #188 Task 5, fix round 1 ----------------------------------------
+
+    /// The confirm-time prune is a revocation path (§1 "Revocation"): a
+    /// worktree git no longer lists loses its allow record, and git not
+    /// answering loses nothing.
+    ///
+    /// Revert-checked, run and restored: with the `outside::prune` call in
+    /// `Hub::retain_listed` removed, fails — observed: `a listing without
+    /// it revokes it: ["wt"]`. With `confirm_worktrees` reading no answer as
+    /// an empty one (`let seen = seen.unwrap_or_default();` in place of its
+    /// `let Some(seen) = seen else { return }` guard), fails — observed:
+    /// `no answer revokes nothing: ["wt"]`, `left: [], right: ["wt"]` (the
+    /// record deleted, its name reported as pruned).
+    #[test]
+    fn a_confirm_prunes_a_removed_outside_worktrees_record() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let fx = outside_fixture("orepo-prune", "wt");
+        let root = crate::projects::roots()[0].clone();
+        let mut h = Hub::new(&fx.project, fx.repo.clone());
+        h.seed_worktrees(seen(&fx.repo, &root));
+        crate::outside::allow(&fx.project, &fx.wt).unwrap();
+        assert_eq!(outside_records_on_disk(&fx.project), vec!["wt".to_string()], "setup: allowed");
+
+        let none_pruned = h.apply_worktrees(seen_worktrees(Vec::new(), &[root.clone()]));
+        assert_eq!(outside_records_on_disk(&fx.project), vec!["wt".to_string()], "no answer revokes nothing: {none_pruned:?}");
+        assert!(none_pruned.is_empty());
+
+        git_ok(&fx.repo, &["worktree", "remove", fx.wt.to_str().unwrap()]);
+        let pruned = h.apply_worktrees(seen(&fx.repo, &root));
+        let left = outside_records_on_disk(&fx.project);
+        assert!(left.is_empty(), "a listing without it revokes it: {left:?}");
+        assert_eq!(pruned, vec!["wt".to_string()], "and says which, for ProjectsChanged");
+    }
+
+    /// The confirm thread tells every switcher after a prune, with no lock
+    /// held (`broadcast_all` locks every hub, this one included).
+    ///
+    /// Revert-checked, run and restored: with the `broadcast_all` call in
+    /// `worktrees_changed`'s thread removed, fails after the 20 s wait —
+    /// observed: `timed out waiting for "t":"ProjectsChanged"; got []`.
+    #[test]
+    fn a_prune_on_the_confirm_thread_sends_projects_changed() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let mut fx = outside_fixture("orepo-pc", "wt");
+        let root = crate::projects::roots()[0].clone();
+        let hub = fx.register(Hub::new(&fx.project, fx.repo.clone()));
+        Hub::lock(&hub).seed_worktrees(seen(&fx.repo, &root));
+        crate::outside::allow(&fx.project, &fx.wt).unwrap();
+        git_ok(&fx.repo, &["worktree", "remove", fx.wt.to_str().unwrap()]);
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        {
+            let mut h = Hub::lock(&hub);
+            h.worktrees_changed(&hub);
+        }
+        let (got, _) = await_containing(&rxa, r#""t":"ProjectsChanged""#);
+        assert!(got.contains(&fx.project), "{got}");
+        assert!(outside_records_on_disk(&fx.project).is_empty());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Hub::lock(&hub).worktrees_confirming {
+            assert!(std::time::Instant::now() < deadline, "the confirm thread never finished");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Spec §3 covers every worktree page, and the commonest is a sibling
+    /// (`git worktree add ../x`, URL `x`): no `.claude/` in its URL at all,
+    /// so only its `.git` file names the parent.
+    ///
+    /// Revert-checked, run and restored: with `worktree_parent`'s `.git`
+    /// fallback disabled (returning `None` after the two URL shapes), fails
+    /// — observed: `opening a sibling's page clears it: []`, `left: None,
+    /// right: Some(0)`.
+    #[test]
+    fn opening_a_sibling_worktree_page_clears_its_entry() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ap-sib";
+        let (h, repo, sib) = hub_with_an_appearance(root.path(), p);
+        let hub = register_for_test(h);
+        let (_a, rxa) = conn(&mut Hub::lock(&hub));
+        let (_b, rxb) = conn(&mut Hub::lock(&hub));
+        let parent_of_main = worktree_parent(p, &repo);
+        open_page(p, &repo);
+        let untouched = crate::appeared::load(p).len();
+        open_page("ap-sib-sib", &sib);
+        let (sa, sb) = (appeared_states(&rxa), appeared_states(&rxb));
+        let on_disk = crate::appeared::load(p);
+        ask_env_clear(&[p]);
+        assert_eq!(parent_of_main, None, "a main checkout is no one's worktree");
+        assert_eq!(untouched, 1, "opening the parent itself clears nothing");
+        assert_eq!(sa.last().map(Vec::len), Some(0), "opening a sibling's page clears it: {sa:?}");
+        assert_eq!(sb.last().map(Vec::len), Some(0), "for every browser: {sb:?}");
+        assert!(on_disk.is_empty(), "{on_disk:?}");
+    }
+
+    /// The two URL shapes are read off the URL alone: `dir` here has no
+    /// `.git`, so the fallback cannot answer for them.
+    ///
+    /// Revert-checked, run and restored: with the `split_url` arm made
+    /// unmatchable, fails — observed: `left: None, right: Some("p")` on the
+    /// outside URL. With the `.claude/worktrees/` arm made unmatchable,
+    /// fails — observed: `left: None, right: Some("a/p")`.
+    #[test]
+    fn worktree_parent_reads_both_url_shapes() {
+        let d = tempfile::tempdir().unwrap();
+        let none = d.path().join("no-such-dir");
+        assert_eq!(worktree_parent("p/.claude/outside/wt", &none), Some("p".to_string()));
+        assert_eq!(worktree_parent("a/p/.claude/worktrees/worktree-x", &none), Some("a/p".to_string()));
+        assert_eq!(worktree_parent("p/.claude/worktrees/a/b", &none), None, "one segment only");
+        assert_eq!(worktree_parent("p", &none), None);
+    }
+
+    /// Anything about `.git` that is not exactly a linked worktree's
+    /// pointer is "no parent".
+    #[test]
+    fn worktree_parent_refuses_an_unexpected_git_file() {
+        let d = tempfile::tempdir().unwrap();
+        for body in ["", "gitdir: /x/.git/modules/m\n", "gitdir: /x/notgit/worktrees/n\n", "gitdir: /x/.git/worktrees/n\nextra\n", "nope"] {
+            std::fs::write(d.path().join(".git"), body).unwrap();
+            assert_eq!(main_checkout_of(d.path()), None, "{body:?}");
+        }
+        std::fs::write(d.path().join(".git"), "gitdir: /x/.git/worktrees/n\n").unwrap();
+        assert_eq!(main_checkout_of(d.path()), Some(std::path::PathBuf::from("/x")), "control");
+        assert_eq!(main_checkout_of(&d.path().join("missing")), None);
+    }
+
+    /// With no hub open for the parent, the clear goes straight to the file.
+    ///
+    /// Revert-checked, run and restored: with the `None` arm of
+    /// `clear_appeared_on_open` doing nothing, fails — observed: `with no
+    /// hub open the file is cleared: [Appeared { path:
+    /// "/home/claude/scratch/tmp/.tmpeuSd0F/ap-nohub/.claude/worktrees/worktree-x",
+    /// branch: "x" }]`.
+    #[test]
+    fn opening_a_worktree_page_clears_it_with_no_parent_hub_open() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        ask_env(root.path());
+        let p = "ap-nohub";
+        let repo = root.path().join(p);
+        init_repo(&repo);
+        git_ok(&repo, &["worktree", "add", "-q", "-b", "x", ".claude/worktrees/worktree-x"]);
+        let wt = repo.join(".claude/worktrees/worktree-x").canonicalize().unwrap();
+        crate::appeared::add(p, crate::appeared::Appeared { path: wt.to_string_lossy().into_owned(), branch: "x".into() });
+        assert!(open_hub(p).is_none(), "setup: no hub for the parent");
+        open_page(&format!("{p}/.claude/worktrees/worktree-x"), &wt);
+        let left = crate::appeared::load(p);
+        ask_env_clear(&[]);
+        assert!(left.is_empty(), "with no hub open the file is cleared: {left:?}");
+    }
+
+    /// A worktree removed while roost was stopped: the seed at start is a
+    /// listing without it, so its banner and allow record go. A seed that
+    /// arrives after the baseline is set changes nothing — it may be older
+    /// than a confirm that already ran.
+    ///
+    /// Revert-checked, run and restored: with the `retain_listed` call in
+    /// `seed_worktrees` removed, fails — observed: `the seed clears what
+    /// git no longer lists: [Appeared { path: "/home/claude/scratch/tmp/
+    /// .tmpoowXiW/wt", branch: "sib" }]`. With the `(None, Some)` guard
+    /// loosened to `(_, Some)`, so every seed applies, fails — observed: `a
+    /// late seed clears nothing: []`, `left: 0, right: 1`.
+    #[test]
+    fn a_seed_clears_what_was_removed_while_stopped() {
+        let _g = crate::wsstate::STATE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _s = crate::session::SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ROOST_CMD", "cat");
+        let fx = outside_fixture("orepo-seed", "wt");
+        let root = crate::projects::roots()[0].clone();
+        // The previous run: an appearance and an allow, then a stop.
+        crate::outside::allow(&fx.project, &fx.wt).unwrap();
+        crate::appeared::add(&fx.project, crate::appeared::Appeared { path: fx.wt.to_string_lossy().into_owned(), branch: "sib".into() });
+        git_ok(&fx.repo, &["worktree", "remove", fx.wt.to_str().unwrap()]);
+        // The restart.
+        let mut h = Hub::new(&fx.project, fx.repo.clone());
+        assert_eq!(h.appeared.len(), 1, "setup: loaded from the previous run");
+        let pruned = h.seed_worktrees(seen(&fx.repo, &root));
+        let left = crate::appeared::load(&fx.project);
+        assert!(left.is_empty(), "the seed clears what git no longer lists: {left:?}");
+        assert!(h.appeared.is_empty(), "and the hub's copy");
+        assert_eq!(pruned, vec!["wt".to_string()]);
+        assert!(outside_records_on_disk(&fx.project).is_empty());
+
+        // A late seed, after the baseline: an entry it does not list stays.
+        let late = "/elsewhere/late".to_string();
+        h.appeared = crate::appeared::add(&fx.project, crate::appeared::Appeared { path: late.clone(), branch: "l".into() });
+        h.seed_worktrees(seen(&fx.repo, &root));
+        let left = crate::appeared::load(&fx.project);
+        assert_eq!(left.len(), 1, "a late seed clears nothing: {left:?}");
     }
 }

@@ -39,6 +39,23 @@ const pendingFocus = (() => {
   return f && /^[A-Za-z0-9_-]{1,32}$/.test(f) ? f : null;   // session-name shape
 })();
 let pendingFocusDone = false;
+// A terminal link's "That's in <project> — open" banner (PathElsewhere,
+// #158 §3) navigates here with ?open=<rel>[:line], read once at load —
+// alongside pendingFocus and pendingLaunch above, and before either of
+// their own `history.replaceState` calls run, so all three are already
+// captured from the original query string regardless of which one strips
+// it first. Validated the same way a server-sent value would be: relative
+// (a leading "/" would be absolute, which this never sends), no ".."
+// segment, and bounded in length — a stray or hand-edited query string
+// must not send an arbitrary string into OpenPath, even though the
+// receiving project's own server confines it again before anything opens.
+const pendingOpen = (() => {
+  const o = new URLSearchParams(location.search).get("open");
+  if (!o || o.length > 4096 || o.startsWith("/")) return null;
+  if (o.split("/").some((seg) => seg === "..")) return null;
+  return o;
+})();
+let pendingOpenSent = false;
 // The blank tab opened synchronously on the "new worktree" click, navigated
 // when WorktreeReady arrives. Opened on the click because a window.open after
 // a websocket round trip is not reliably inside the user gesture.
@@ -403,6 +420,11 @@ const PANE_ICONS = {
   // as the header's own close button (`SVG_X` in render.rs).
   close: '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
   prloop: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 6.4a5.6 5.6 0 0 1 9.3-2.2l1.5 1.4"/><path d="M13.4 9.6a5.6 5.6 0 0 1-9.3 2.2L2.6 10.4"/><path d="M13.6 2.4v3.2h-3.2M2.4 13.6v-3.2h3.2"/></svg>',
+  // A tray with an arrow leaving it: the tree's upload button (see
+  // buildPaneIcons).
+  upload: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10.5V2.5M5 5.5l3-3 3 3M2.5 10v3.5h11V10"/></svg>',
+  // A speech bubble: the chat view of this Claude terminal (static/chat.js).
+  chat: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2.5 3.5h11v7.5H7l-3 2.5V11H2.5z"/></svg>',
   newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
 // The official Claude mark (lobehub packaging of Anthropic's starburst,
@@ -427,7 +449,7 @@ const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${locat
 // server-side too (SetMode refuses it, OpenTab coerces a raw Edit request to
 // Preview, and EditBuffer — the actual save chokepoint — refuses to create a
 // buffer at all), so no client bug here can make a save truncate a file.
-const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf"];
+const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "mp4", "m4v", "mov", "webm"];
 // Must extract the extension exactly as assets::ext_of does, or syncing the
 // lists would not sync the behaviour: take the LAST path segment (so
 // `img.d/README` has no extension rather than inheriting `d`) and require a
@@ -439,15 +461,17 @@ const extOf = (rel) => {
 };
 const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 /// Files this app can *draw* rather than only spell out: markdown renders, and
-/// so does every image, and a PDF through the browser's own viewer (#121).
-/// Mirrors routes.rs's IMAGE_EXT and PDF_EXT plus the two markdown extensions
+/// so does every image, a PDF through the browser's own viewer (#121), and a
+/// video through its player. Mirrors routes.rs's IMAGE_EXT, PDF_EXT and
+/// VIDEO_EXT plus the two markdown extensions
 /// render.rs's file_fragment branches on.
 ///
 /// Deliberately wider than NO_TEXT_EDIT_EXT, and the gap is the point — svg is
 /// here *and* editable, because it draws as a picture and is text. CLAUDE.md
 /// records the release where gating Edit on "is it an image" silently took
 /// that away.
-const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf"];
+const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf",
+  "mp4", "m4v", "mov", "webm"];
 const hasRenderedForm = (rel) => RENDERED_EXT.includes(extOf(rel));
 /// How a file opens when the user just clicks it.
 ///
@@ -752,6 +776,7 @@ function onEvent(ev) {
       // after `state` itself was just replaced above.
       state.proposals = proposals;
       render();
+      renderAppeared(state.appeared || []);
       // Toggling visibility changes what the *server* renders, not how the
       // client draws it, so the State that carries the new value has to be
       // followed by a re-fetch. refreshTree (not a remount) keeps whatever
@@ -775,6 +800,16 @@ function onEvent(ev) {
         if (state.panes.some((p) => p.tabs.some((t) => t.k === "Terminal" && t.session === pendingFocus))) {
           focusSession(pendingFocus);
         }
+        history.replaceState(null, "", location.pathname);
+      }
+      // A "That's in <project> — open" banner (PathElsewhere) arrives with
+      // ?open=<rel>[:line]; send it once, after the first State, the same
+      // OpenPath a terminal link sends — this project's own server
+      // confines it again, exactly as it would for a click here. Then
+      // strip it so a reload doesn't resend it.
+      if (pendingOpen && !pendingOpenSent) {
+        pendingOpenSent = true;
+        send({ t: "OpenPath", text: pendingOpen });
         history.replaceState(null, "", location.pathname);
       }
       break;
@@ -935,10 +970,10 @@ function onEvent(ev) {
       } else {
         // The popup was blocked (or something else closed it): fall back to
         // a link rather than lose the worktree the server already created.
-        showBanner(`opened ${ev.url.split("/").pop()} — `);
+        const box = showBanner(`opened ${ev.url.split("/").pop()} — `);
         const a = document.createElement("a");
         a.href = url; a.target = "_blank"; a.textContent = "click to go there";
-        document.querySelector(".error-banner:last-of-type b")?.append(a);
+        bannerLink(box, a);
       }
       pendingTab = null;
       document.body.dispatchEvent(new Event("projects"));
@@ -951,10 +986,10 @@ function onEvent(ev) {
       // same transient-banner-plus-link fallback `WorktreeReady` uses when
       // its popup is blocked is the whole of what this can do: say where it
       // went, and offer a way there.
-      showBanner(`${ev.session} moved to ${ev.owner.split("/").pop()} → `);
+      const box = showBanner(`${ev.session} moved to ${ev.owner.split("/").pop()} → `);
       const a = document.createElement("a");
       a.href = "/" + projectPath(ev.owner); a.target = "_blank"; a.textContent = "open it there";
-      document.querySelector(".error-banner:last-of-type b")?.append(a);
+      bannerLink(box, a);
       break;
     }
     case "ClaudeElsewhere": {
@@ -966,21 +1001,55 @@ function onEvent(ev) {
       // project's browsers see this; the client only renders it.
       if (ev.worktree) {
         const name = ev.worktree.split("/").pop();
-        showBanner(`${ev.session}'s Claude is working in ${name}`);
-        const box = document.querySelector(".error-banner:last-of-type");
+        const box = showBanner(`${ev.session}'s Claude is working in ${name}`);
         const b = document.createElement("button");
         b.textContent = "Move tab there";
         b.onclick = () => { send({ t: "Rehome", session: ev.session, to: ev.worktree }); box?.remove(); };
-        box?.append(b);
+        bannerButton(box, "rehome", b);
         offerWorktreeHooksOnce(box);
       } else {
-        showBanner(`${ev.session}'s Claude is working in the main checkout`);
-        const box = document.querySelector(".error-banner:last-of-type");
+        const box = showBanner(`${ev.session}'s Claude is working in the main checkout`);
         const b = document.createElement("button");
         b.textContent = "Move back";
         b.onclick = () => { send({ t: "Rehome", session: ev.session, to: null }); box?.remove(); };
-        box?.append(b);
+        bannerButton(box, "rehome", b);
       }
+      break;
+    }
+    case "WorktreeAppeared":
+      // No banner from this event any more (#188 §3). It reached only the
+      // pages connected at that moment and its banner was gone after 8 s;
+      // the hub now records every appearance and the State snapshot that
+      // follows carries the whole list, which `renderAppeared` shows until
+      // it is dismissed. The event still arrives, and still means the
+      // switcher has a new row to show.
+      document.body.dispatchEvent(new Event("projects"));
+      break;
+    case "OutsideAllowed": {
+      // Sent to this connection only, after the allow record was written
+      // and every switcher already told. The URL is roost's own virtual
+      // `<parent>/.claude/outside/<name>`, but its parts came from the
+      // filesystem, so it is still built through `projectPath`.
+      const box = showBanner("Allowed — ");
+      const a = document.createElement("a");
+      a.href = "/" + projectPath(ev.url); a.target = "_blank"; a.textContent = "open";
+      bannerLink(box, a);
+      break;
+    }
+    case "ProjectMoved": {
+      // A project or worktree directory was renamed and its live terminals
+      // followed (#158 §5). Sent to both pages: the old one gets a way to
+      // the new page, the new one the reason for its new tabs. URLs came
+      // from the filesystem, so text only and the link through projectPath.
+      const from = ev.from.split("/").pop();
+      const to = ev.to.split("/").pop();
+      const box = showBanner(`${from} was renamed to ${to}; its terminals followed`);
+      if (ev.to !== PROJECT) {
+        const a = document.createElement("a");
+        a.href = "/" + projectPath(ev.to); a.textContent = " open " + to;
+        bannerLink(box, a);
+      }
+      document.body.dispatchEvent(new Event("projects"));
       break;
     }
     case "WorktreeGone": {
@@ -1168,6 +1237,29 @@ function onEvent(ev) {
         pendingLink = null;
       }
       break;
+    case "PathElsewhere": {
+      // A terminal link `resolve_terminal_path` refused, but
+      // `projects::project_for_abs` could place in a *different* roost
+      // project (#158 §3). Only an offer: nothing opens here. The event
+      // carries no `text`, so — unlike PathRefused — this cannot match it
+      // back to `pendingLink`'s click; clearing focusNextReveal still
+      // applies, the same reasoning the PathRefused case gives: no
+      // RevealLine is coming for this click either.
+      focusNextReveal = false;
+      const name = ev.project.split("/").pop();
+      const box = showBanner(`That's in ${name} — `);
+      const a = document.createElement("a");
+      const open = ev.rel + (ev.line ? ":" + ev.line : "");
+      // The new page's own server confines this OpenPath exactly as this
+      // one would confine a click here — `ev.rel`/`ev.project` are server
+      // output either way, so building the link from them is no different
+      // in kind from the href WorktreeAppeared builds from `ev.url`.
+      a.href = "/" + projectPath(ev.project) + "?open=" + encodeURIComponent(open);
+      a.target = "_blank";
+      a.textContent = "open";
+      bannerLink(box, a);
+      break;
+    }
     case "SearchResults":
       // A late answer to a query the user has typed past must not paint over
       // what they are looking at now. The server drops most of these; this is
@@ -1272,8 +1364,10 @@ function render() {
   // is the right contribution there — nothing is taking up that space.
   const mbar = document.getElementById("mobilebar");
   if (mbar) document.documentElement.style.setProperty("--mobilebar-h", mbar.offsetHeight + "px");
-  const tkeys = document.getElementById("termkeys");
-  if (tkeys) document.documentElement.style.setProperty("--termkeys-h", tkeys.offsetHeight + "px");
+  // Before the measurement below, which reads the bar's height: a State
+  // broadcast can put a terminal in front (or take it away) without a pane
+  // switch, e.g. ✻ pressed in the pane that is showing a file.
+  syncTermKeys();
   // htmx swaps into #gitinfo/#wtlabel and the #projcount/#bellcount writes
   // below all change the header's width while the panel is open, and
   // #searchbox uses margin:auto, so the field (and the panel anchored to it)
@@ -1554,6 +1648,25 @@ function buildPaneIcons(host, pi, pane, active, content) {
       });
       if (yes) newTerminal(pi, "prloop");
     }, "newprloop");
+  }
+  // The chat view, offered on a terminal roost knows is running Claude —
+  // anywhere else it would open onto "no Claude here".
+  if (active && active.k === "Terminal" && (state.claude_sessions || []).includes(active.session)
+      && typeof openChat === "function") {
+    icon(PANE_ICONS.chat, "chat with this Claude", () => openChat(active.session, active.home), "openchat");
+  }
+  // #110 put "Upload files…" in the tree's context menu, but that menu is
+  // reached by `contextmenu`, which iOS Safari never fires for a
+  // long-press — so on an iPhone upload was still unreachable. A button
+  // needs no gesture a phone lacks. Uploads to the project root; the menu
+  // (long-press on a phone) is still the way to aim at a folder.
+  //
+  // On any pane that *holds* the tree, not only while the tree is its active
+  // tab: on a phone, a Claude opened from the Files view lands in that same
+  // pane, and with the terminal in front the button vanished from the one
+  // view a phone user goes to for files.
+  if (pane.tabs.some((t) => t.k === "Tree")) {
+    icon(PANE_ICONS.upload, "upload files to the project root", () => pickAndUpload(""), "upload");
   }
   if (active && active.k === "Tree") {
     const hidden = showHidden();
@@ -2439,6 +2552,84 @@ function pickedInTreeOrder() {
   return seen;
 }
 
+// --- long-press = right-click, on a touch screen -------------------------
+//
+// The tree's and the Changes list's menus are reached by `contextmenu`, and
+// iOS Safari never fires one for a long-press. So a held finger on either
+// sends the same event a right-click does, at the finger — every existing
+// handler (a file, a folder, blank space, a change row) answers it unchanged,
+// and there is no second menu implementation to drift.
+//
+// Two things a long-press must not also do. Android *does* fire its own
+// `contextmenu` for the same press, so whichever of the two comes first wins
+// and the other is swallowed. And lifting the finger still clicks, which
+// would open the file or fold the folder under the menu; that one click is
+// swallowed too. Limited to those two panes: in an editor or a terminal a
+// long-press selects text, and that must keep working.
+const LONG_PRESS_MS = 500;
+const LONG_PRESS_SLOP_PX = 10;
+const longPress = { timer: 0, x: 0, y: 0, target: null, fired: false, swallowClickUntil: 0 };
+
+function longPressArea(t) {
+  return t && t.closest && t.closest('.content[data-kind="Tree"], .content[data-kind="Changes"]');
+}
+
+function cancelLongPress() {
+  clearTimeout(longPress.timer);
+  longPress.timer = 0;
+  longPress.target = null;
+}
+
+document.addEventListener("pointerdown", (e) => {
+  cancelLongPress();
+  longPress.fired = false;
+  if (e.pointerType !== "touch" || !longPressArea(e.target)) return;
+  longPress.x = e.clientX;
+  longPress.y = e.clientY;
+  longPress.target = e.target;
+  longPress.timer = setTimeout(() => {
+    const target = longPress.target;
+    longPress.timer = 0;
+    if (!target || !target.isConnected || longPress.fired) return;
+    longPress.fired = true;
+    longPress.swallowClickUntil = Date.now() + 1500;
+    target.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true, cancelable: true, clientX: longPress.x, clientY: longPress.y,
+    }));
+  }, LONG_PRESS_MS);
+}, true);
+
+document.addEventListener("pointermove", (e) => {
+  if (!longPress.timer) return;
+  if (Math.hypot(e.clientX - longPress.x, e.clientY - longPress.y) > LONG_PRESS_SLOP_PX) cancelLongPress();
+}, true);
+document.addEventListener("pointerup", () => { if (longPress.timer) cancelLongPress(); }, true);
+document.addEventListener("pointercancel", cancelLongPress, true);
+
+document.addEventListener("contextmenu", (e) => {
+  // Only the browser's own event for a press this code is tracking.
+  if (!e.isTrusted || !longPressArea(e.target)) return;
+  if (longPress.fired) {
+    e.preventDefault();
+    e.stopPropagation();
+    return;
+  }
+  if (longPress.timer) {
+    // Android got there first: let its event through, and stand down.
+    longPress.fired = true;
+    longPress.swallowClickUntil = Date.now() + 1500;
+    cancelLongPress();
+  }
+}, true);
+
+document.addEventListener("click", (e) => {
+  if (!longPress.fired || Date.now() > longPress.swallowClickUntil) return;
+  longPress.fired = false;
+  if (!longPressArea(e.target)) return;
+  e.preventDefault();
+  e.stopPropagation();
+}, true);
+
 function wireFragment(content) {
   // Changes and Diff show changes, not places: New file, Rename and Delete
   // mean nothing there, and Delete on a change row read as "drop this
@@ -2496,11 +2687,13 @@ async function fileMenu(e, rel, isDir = false) {
   if (rel && !isDir) {
     const dirty = state && state.buffers && state.buffers.some((b) => b.rel === rel && b.dirty);
     items.push({ id: "download", label: dirty ? "Download (saved version)" : "Download" });
-    // #146. Offered when there is a Claude to send to or one can be started;
-    // otherwise it would be an item that can only ever fail.
-    if (LAUNCHES.includes("claude") || (state && (state.claude_sessions || []).length)) {
-      items.push({ id: "claude", label: "Send to Claude" });
-    }
+  }
+  // #146. Offered when there is a Claude to send to or one can be started;
+  // otherwise it would be an item that can only ever fail. A folder too:
+  // Claude Code takes `@dir/` as readily as a file, and the item used to be
+  // missing from a folder's menu altogether.
+  if (rel && (LAUNCHES.includes("claude") || (state && (state.claude_sessions || []).length))) {
+    items.push({ id: "claude", label: "Send to Claude" });
   }
   // #162. A folder — or blank tree space, which is the project root — zips.
   if (isDir || !rel) items.push({ id: "zip", label: "Download as zip" });
@@ -2526,7 +2719,7 @@ async function fileMenu(e, rel, isDir = false) {
   } else if (choice === "zip") {
     downloadZip(rel);
   } else if (choice === "claude") {
-    sendToClaude(rel);
+    sendToClaude(isDir ? `${rel}/` : rel);
   } else if (choice === "upload") {
     pickAndUpload(dir);
   } else if (choice === "rename") {
@@ -4206,13 +4399,27 @@ function showBanner(text) {
   // keystroke with no Claude attached stacked sixteen identical banners down
   // the page, each with its own dismiss button and its own 8s timer. The
   // information in the sixteenth is the same as in the first.
+  //
+  // Returns the banner's box — the existing one when deduped — so a caller
+  // adds its link or button to *this* banner. Looking it up afterwards
+  // (`.error-banner:last-of-type`, which matches by element type, not by
+  // class) found whichever div came last, often another banner.
   const existing = [...document.querySelectorAll(".error-banner")]
     .find((el) => el.dataset.text === text);
   if (existing) {
     const n = Number(existing.dataset.count || "1") + 1;
     existing.dataset.count = String(n);
-    existing.querySelector("b").textContent = `${text} (${n}×)`;
-    return;
+    // The count has its own span after everything else in the line, so
+    // updating it never rewrites — and so never deletes — a link in it.
+    const b = existing.querySelector("b");
+    let count = b.querySelector(".banner-count");
+    if (!count) {
+      count = document.createElement("span");
+      count.className = "banner-count";
+      b.append(count);
+    }
+    count.textContent = ` (${n}×)`;
+    return existing;
   }
   const box = document.createElement("div");
   box.className = "conflict error-banner";
@@ -4225,6 +4432,143 @@ function showBanner(text) {
   box.append(b, dismiss);
   document.body.appendChild(box);
   setTimeout(() => box.remove(), 8000);
+  return box;
+}
+
+// #188's two outside-worktree actions, shared by the header switcher and
+// the appeared banners. Both take their arguments already read out of the
+// DOM: the caller's element may be gone by the time the dialog answers.
+async function allowOutsideFlow(parent, path) {
+  if (!parent || !path) return;
+  const yes = await askConfirm({ title: "Open outside worktree",
+    lines: [`Open ${path} in roost?`,
+            "It is outside roost's roots; roost will open only this worktree."],
+    confirm: "Allow" });
+  if (yes) send({ t: "AllowOutsideWorktree", parent, path });
+}
+
+async function revokeOutsideFlow(parent, name) {
+  if (!parent || !name) return;
+  const yes = await askConfirm({ title: "Revoke outside worktree",
+    lines: [`Stop opening ${name} in roost?`, "Running terminals keep running."],
+    confirm: "Revoke" });
+  if (yes) send({ t: "RevokeOutsideWorktree", parent, name });
+}
+
+// The appeared list (#188 §3): one banner per worktree roost did not make,
+// kept until it is dismissed — here or in any other browser, by opening the
+// worktree's page, or by git no longer listing it. The server owns the
+// list and every State carries all of it, so this only reconciles boxes
+// against it, keyed by path: a State arrives on every debounced keystroke,
+// and rebuilding each time would duplicate nothing but would yank a button
+// out from under a click. Its own container, not `showBanner`, which
+// dedupes by text and removes after 8 s — both wrong for a banner meant to
+// stay, and two worktrees with one basename must not merge.
+const appearedBoxes = new Map(); // path -> { box, sig }
+function renderAppeared(list) {
+  let wrap = document.getElementById("appeared");
+  if (!wrap) {
+    if (!list.length) return;
+    wrap = document.createElement("div");
+    wrap.id = "appeared";
+    document.body.appendChild(wrap);
+  }
+  const want = new Set(list.map((e) => e.path));
+  for (const [path, { box }] of appearedBoxes) {
+    if (!want.has(path)) { box.remove(); appearedBoxes.delete(path); }
+  }
+  const order = [];
+  for (const entry of list) {
+    const sig = JSON.stringify([entry.branch, entry.url, entry.outside, entry.allowed]);
+    let rec = appearedBoxes.get(entry.path);
+    if (!rec || rec.sig !== sig) {
+      const box = appearedBox(entry);
+      if (rec) rec.box.replaceWith(box);
+      rec = { box, sig };
+      appearedBoxes.set(entry.path, rec);
+    }
+    order.push(rec.box);
+  }
+  // Reordered only when the order actually differs, for the same reason
+  // boxes are kept: moving a node mid-click can lose the click.
+  const same = order.length === wrap.children.length && order.every((b, i) => wrap.children[i] === b);
+  if (!same) wrap.replaceChildren(...order);
+}
+
+// Every part of an entry came from git or the filesystem, so it goes in as
+// text, and the one href through `projectPath`.
+function appearedBox(entry) {
+  const name = entry.path.split("/").pop();
+  const box = document.createElement("div");
+  box.className = "conflict appeared-banner";
+  box.dataset.path = entry.path;
+  const b = document.createElement("b");
+  box.append(b);
+  if (entry.outside && !entry.allowed) {
+    b.textContent = `worktree ${name} (${entry.branch}) appeared, outside roost's roots — `;
+    const allow = document.createElement("button");
+    allow.textContent = "Allow…";
+    allow.dataset.role = "allow";
+    const path = entry.path;
+    allow.onclick = () => allowOutsideFlow(PROJECT, path);
+    box.append(allow);
+  } else if (entry.url) {
+    b.textContent = `worktree ${name} (${entry.branch}) appeared — `;
+    const a = document.createElement("a");
+    a.href = "/" + projectPath(entry.url); a.target = "_blank"; a.textContent = "open";
+    b.append(a);
+  } else {
+    // Under a root but not a project of its own (a nested directory, say):
+    // there is no page to link to and nothing to allow, only the news.
+    b.textContent = `worktree ${name} (${entry.branch}) appeared`;
+  }
+  const dismiss = document.createElement("button");
+  dismiss.textContent = "Dismiss";
+  dismiss.dataset.role = "dismiss";
+  dismiss.onclick = () => {
+    send({ t: "DismissAppeared", path: entry.path });
+    // Gone here at once; the broadcast State that follows takes it off
+    // every other browser, and would put it back here if the send failed.
+    const rec = appearedBoxes.get(entry.path);
+    if (rec) { rec.box.remove(); appearedBoxes.delete(entry.path); }
+  };
+  box.append(dismiss);
+  return box;
+}
+
+// The persistent header note on an allowed outside worktree's page (#188
+// §2): its URL reads like any worktree of its parent, so the page says
+// where it really is. The path is the server's own record, from an
+// attribute it escaped; it goes in as text.
+{
+  const real = document.body.dataset.outside;
+  const wt = document.getElementById("wtbtn");
+  if (real && wt) {
+    const note = document.createElement("span");
+    note.id = "outsidenote";
+    note.textContent = `outside roost's roots: ${real}`;
+    note.title = real;
+    wt.after(note);
+  }
+}
+
+// A banner's one link, in its text line: replaces the link an identical
+// earlier banner got (a deduped banner keeps exactly one, the latest — two
+// clicks on different files in the same project share the text), and goes
+// before the count.
+function bannerLink(box, a) {
+  const b = box?.querySelector("b");
+  if (!b) return;
+  b.querySelector("a")?.remove();
+  b.insertBefore(a, b.querySelector(".banner-count"));
+}
+
+// A banner's one action button of `role`, replaced the same way.
+function bannerButton(box, role, button) {
+  if (!box) return;
+  box.querySelector(`button[data-role="${role}"]`)?.remove();
+  button.dataset.role = role;
+  box.append(button);
 }
 
 // Offered alongside the "Move tab there" banner, once per project per
@@ -4443,9 +4787,34 @@ function showMobilePane(pi) {
   // alone, because switching panes does not go through a State broadcast —
   // without this the grid keeps the previous pane's arithmetic and the
   // terminal is fitted to a frame the wrong size by exactly the bar.
+  syncTermKeys();
+  fitTerminals();
+}
+
+/// Whether the pane the switcher has in front is showing a terminal.
+///
+/// Asked of the layout, not of the pane's number. The key bar used to be
+/// `body[data-mpane="3"]`, on the assumption that terminals live in the right
+/// pane — but every pane header has + and ✻, so a Claude started from the
+/// pane that was showing a file opened there, in pane 2, and came up with no
+/// arrows, Esc or Enter: unusable on a phone, which is what the bar is for.
+function frontIsTerminal() {
+  if (!state) return false;
+  const pane = state.panes[Number(document.body.dataset.mpane)];
+  const t = pane && pane.tabs[pane.active];
+  return !!(t && t.k === "Terminal");
+}
+
+/// Shows the key bar exactly when a terminal is in front, and re-measures the
+/// height #grid subtracts for it. Re-fits only when that height changed, since
+/// `render()` calls this on every State broadcast.
+function syncTermKeys() {
+  const on = frontIsTerminal();
+  const changed = document.body.classList.contains("termfront") !== on;
+  document.body.classList.toggle("termfront", on);
   const tk = document.getElementById("termkeys");
   if (tk) document.documentElement.style.setProperty("--termkeys-h", tk.offsetHeight + "px");
-  fitTerminals();
+  if (changed) fitTerminals();
 }
 
 /// The gesture route: a tap that means "show me this" has to also bring the
@@ -4491,9 +4860,11 @@ function appCursor(t) {
 }
 
 /// The terminal a key press should go to: the one showing in the pane the
-/// switcher has in front, falling back to the last focused session.
+/// switcher has in front, falling back to the last focused session. The front
+/// pane, not pane 3 — see `frontIsTerminal`.
 function targetTerm() {
-  const host = document.querySelector('.pane[data-pane="3"] .termhost[data-session]');
+  const n = String(Number(document.body.dataset.mpane));
+  const host = document.querySelector(`.pane[data-pane="${n}"] .termhost[data-session]`);
   const byPane = host && terms.get(host.dataset.session);
   return byPane || terms.get(lastFocusedSession) || null;
 }
@@ -4794,6 +5165,21 @@ if (wtBtn && wtPanel) {
                 "roost re-checks that it is clean, idle and merged first."],
         confirm: "Remove", danger: true });
       if (yes) send({ t: "RemoveWorktree", key });
+      return;
+    }
+    // #188's two controls on a worktree outside every root. Same rule as
+    // ✕ above: the dataset is read before the dialog's await, since the
+    // row can be re-rendered out from under it while the dialog is open.
+    const allow = e.target.closest(".wtallow");
+    if (allow) {
+      e.preventDefault();
+      allowOutsideFlow(allow.dataset.parent, allow.dataset.path);
+      return;
+    }
+    const revoke = e.target.closest(".wtrevoke");
+    if (revoke) {
+      e.preventDefault();
+      revokeOutsideFlow(revoke.dataset.parent, revoke.dataset.name);
       return;
     }
     if (e.target.closest("a")) wtPanel.hidden = true;

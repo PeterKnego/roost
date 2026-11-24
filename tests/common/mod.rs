@@ -131,16 +131,15 @@ pub fn two_project_fixture(a: &str, b: &str) -> (tempfile::TempDir, u16) {
 /// is for the cases that also need to assert on status and content-type.
 pub fn get_full(port: u16, path: &str) -> (u16, String, String) {
     let url = format!("http://127.0.0.1:{port}{path}");
-    let resp = ureq::get(&url).call();
-    match resp {
-        Ok(r) => {
-            let status = r.status();
-            let ctype = r.header("content-type").unwrap_or("").to_string();
-            (status, ctype, r.into_string().unwrap_or_default())
-        }
-        Err(ureq::Error::Status(code, r)) => {
-            let ctype = r.header("content-type").unwrap_or("").to_string();
-            (code, ctype, r.into_string().unwrap_or_default())
+    // ureq 3 turns a 4xx/5xx into `Error::StatusCode` and drops the body,
+    // which is exactly what these tests assert on — so it is told not to.
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
+    match agent.get(&url).call() {
+        Ok(mut r) => {
+            let status = r.status().as_u16();
+            let ctype = r.headers().get("content-type")
+                .and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            (status, ctype, r.body_mut().read_to_string().unwrap_or_default())
         }
         Err(e) => panic!("request failed: {e}"),
     }

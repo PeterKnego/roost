@@ -68,11 +68,48 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   and left every running Claude unreachable by Alt+K. Persisting it widens
   nothing: the same user can already read it from `~/.claude/ide/<port>.lock`,
   and the browser half of the CVE is closed by the Origin refusal, not by the
-  token being fresh.
+  token being fresh. That argument holds only because the lock file is as
+  private as the token file: `idelock::write_body` creates it 0600 (it took
+  the umask until #184, which left it 0664), and never chmods the shared
+  `~/.claude/ide` it did not create — it warns once if that is open.
 - **Every filesystem path is confined** before use: `projects::safe_resolve`
   for existing targets, `projects::safe_resolve_parent` for creation and rename
   destinations (it canonicalises the parent and validates the final component,
   because the target does not exist yet).
+
+  **The one exception** is an allowed outside worktree (#188). A cloned
+  repository's worktree metadata can point a worktree anywhere, so a project
+  URL of the shape `<parent>/.claude/outside/<name>` resolves outside the
+  roots only through a roost-written allow record at
+  `state/outside/<parent key>/<name>`, written after a user confirms, on
+  git's own listing of the path as a worktree of a project under the roots.
+  `projects::resolve_project_with`'s first arm (the `/.claude/outside/` one)
+  decides this shape exhaustively and hands it to `outside::resolve`
+  (`outside::resolve_in`) before any of the ordinary checks run; nothing
+  with the outside segment ever falls through to try the literal path on
+  disk. The identity it checks is three-part — `(dev, ino, birth time)`, not
+  just `(dev, ino)` — because a probe of this project's own ext4 filesystem
+  found `rm` followed by `mkdir` at the same path reusing the just-freed
+  inode every time; birth time was the one field that changed on every
+  recreation (the module doc of `src/outside.rs`) — but that probe ran from
+  a shell, slower than a clock tick. A new inode is stamped from the coarse
+  clock, so a recreation inside one tick (≤4 ms) keeps the old birth time as
+  well: an in-process `rmdir` + `mkdir` did so 196 times in 200 on ext4 on
+  kernel 7.0, not only on old kernels, and the identity cannot tell it
+  apart. #203 holds a parked design for adding the inode generation number,
+  which needs no clock. An unreadable birth time refuses the
+  allow and fails the resolve, the same as a mismatch. `AllowOutsideWorktree`
+  also refuses a path already under a root and a worktree of anything but
+  the parent's *main* checkout, so one directory can never end up with two
+  project keys (`Hub::do_allow_outside`).
+
+  It is narrow on purpose: the record lives only in roost's own state, never
+  in a repository or in project config, so a clone cannot allow itself, and
+  it names one directory by identity — anything that does not match resolves
+  to `None`. Never make these "consistent" with the rest of this bullet:
+  resolving the virtual path through disk, accepting a record without an
+  identity match, or letting project config or a repository write records.
+  Each is the vulnerability, not the cleanup.
 - **Session names match `^[A-Za-z0-9_-]{1,32}$`** — they land in a dtach socket
   path and a command line.
 - **A text file opens in Edit; only a file with a rendered form opens in
@@ -134,11 +171,24 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   name the project it was *started* in — its home — and none of them can
   move: the socket path is baked into the dtach master's argv, the pump
   thread exits when its key disappears from the map, and the environment is
-  the process's own. Approving a Claude's `WorktreeCreate` ask re-homes the
-  terminal that asked into the worktree's project without moving any of
-  that; `src/home.rs` records the new owner at
-  `state/home/<home key>/<name>` and nothing in the rest of the codebase
-  learns about it.
+  the process's own. A session is re-homed only on positive evidence that
+  its own Claude process moved — the claudes watcher seeing, within
+  `claudes::EXPECT_MOVE_WINDOW` (30s), that Claude's `/proc` cwd land inside
+  the exact worktree an approval named — or on the user's own "Move tab
+  there". Approving a `WorktreeCreate` ask (`hub::approve_ask`) no longer
+  re-homes by itself; it only records that expectation
+  (`claudes::expect_move`) for the watcher to act on. The re-home itself
+  still runs through `hub::rehome_to`, which writes the new owner via
+  `src/home.rs` at `state/home/<home key>/<name>`, and nothing in the rest
+  of the codebase learns about it.
+
+  **Reconciling the hook's intent with the process's evidence is the
+  vulnerability, not the cleanup.** Claude Code fires `WorktreeCreate` with
+  no distinguishing field for `EnterWorktree`, `claude --worktree`, and a
+  subagent's `isolation: "worktree"` — so re-homing straight off the ask
+  would move a terminal whose own Claude never moved, on a subagent's
+  say-so. Only that Claude's own process actually entering the worktree is
+  evidence it asked.
 
   The record is read three ways, never two: `NotFound` means *here* (home
   and owner are the same project), unreadable or empty means *unknown*, and
@@ -161,6 +211,17 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   lock or the `REGISTRY` lock, for the same reason every other git
   invocation here doesn't: a stalled `git` must not freeze every websocket
   or wedge the sweep that every project's reconcile runs through.
+
+  **A renamed project's sessions follow it the same way: on evidence, not
+  on request.** `.moved-to` (`sock/<old key>/.moved-to`) is written only
+  when `registry::move_evidence` confirms #178's inode evidence and the
+  directory's new path resolves as a project. `term.rs` widens only for
+  an owner that a `.moved-to` names, and `home::resolves` for that owner or
+  for one whose directory carries the record's *own* full `.ino` identity
+  (#183, `home::owner_dir_with`) — never the key's, and nothing else
+  widens. `term.rs`'s widened path is attach-only: it calls
+  `session::attach_existing`, a `dtach -a` that fails closed, so a key
+  whose directory is gone can be joined but never made to spawn.
 - **Search shares the tree's filter but is not the tree.** `search.rs` walks
   with `projects::TreeFilter`, so `show_hidden` and the `hide` list mean the
   same thing in both — but it additionally refuses `.git` and any directory
@@ -239,6 +300,11 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   is 90s (`cli::REPLY_TIMEOUT`) — strictly between that 60s and Claude Code's
   own 120s hook kill, so a wedged roost's hold on the hook ends with a
   reason this process names, not a bare "killed" from Claude Code's side.
+  An approved worktree move stays expected for 30s
+  (`claudes::EXPECT_MOVE_WINDOW`) — long enough for Claude to act on the
+  reply and for one watcher tick to see it, short enough that a subagent's
+  approval, which never moves the parent, expires before anything else
+  could be mistaken for it.
   Search is bounded by four at once (`search.rs`): 50 results per
   category, 5 lines per file, 20 000 files examined, and a 1500 ms deadline —
   constants, deliberately not config keys, and every one of them *names itself*
@@ -250,11 +316,16 @@ These are load-bearing. Breaking one is a defect, not a style choice.
   `openDiff` are
   bounded by the same 2 MB `MAX_FILE_BYTES` as any other file, since a
   proposal is retained for the tab's life and broadcast whole to every
-  connected browser.
+  connected browser. Outside worktrees (#188): ≤32 allow records per parent
+  (`outside::OUTSIDE_CAP`), and ≤16 appeared-worktree entries per project
+  (`appeared::APPEARED_CAP`), oldest dropped first, each naming itself when
+  it fires. Rename-following (#183): `.occupant-ino` holds at most
+  `OCCUPANT_CAP` (8) identities per key, oldest dropped first and the drop
+  logged once.
 
 ## Absence of evidence is not evidence of absence
 
-**Eleven separate defects in one feature were the same mistake**: code concluded
+**Twelve separate defects were the same mistake**: code concluded
 something was gone, dead, or empty because the *check* failed, then destroyed it.
 Every one could kill a user's long-running shell or overwrite their file.
 
@@ -271,9 +342,62 @@ Every one could kill a user's long-running shell or overwrite their file.
 | An empty or truncated `.origin` marker | the directory was deleted | the recorded session |
 | `Path::is_dir()` swallowing `EACCES` | the directory was deleted | the recorded session |
 | `Path::exists()` on a dangling symlink | the destination is free | the symlink's target |
+| A project directory renamed (`git worktree move`, `mv`) | the directory was deleted | every live session working in it |
 
-The last one is in a different module from the rest, so treat this as systemic,
-not as a `registry.rs` quirk.
+The `Path::exists()` row is in a different module from the rest, so treat this
+as systemic, not as a `registry.rs` quirk. The rename row is the `.origin`
+safeguard defeated: the recorded path really is `NotFound`, and only the
+directory's inode tells a move from a delete. It is looked for three ways, in
+order, and a delete is concluded only when all three come back empty: the
+directory a `.moved-to` names, a live shell's cwd (`registry::move_evidence`,
+#178), and the siblings of where it last was (`registry::sibling_evidence`,
+#182 — a rename made with no shell inside leaves only the directory itself as
+a witness). A sibling that cannot be listed or stat'd is "cannot tell".
+
+**Rename-following (#183) used to decide a terminal's owner from evidence
+about its whole key; it now decides per terminal.** A record's owner changes
+only when `registry::find_by_identity` finds that record's *own* identity —
+not any directory's — at the `.moved-to` target, among the old path's
+siblings, or at a resident Claude's cwd, and `claudes::rewrite_owner` and
+`home::follow_move_in` then write the *found* directory's identity into the
+record they move, never the key's. A match git cannot vouch for is
+`CannotTell`, not evidence, so a plain `mv` of a worktree — as opposed to
+`git worktree move` — leaves git still listing the old path, and a record
+whose identity turns up there stays suspended (kept, logged once) until
+`git worktree repair` lets git vouch for it again. The same rule runs
+backwards: a record is never forgotten into a home URL that now holds a
+different directory. R18 (`claudes::sweep_gone_owners`) forgets a record
+only when its home resolves to the directory carrying its *own*
+recorded identity, or is gone outright (`claudes::home_is_its_own`); an
+occupant, or an identity that cannot be read, keeps the record instead.
+One case has no evidence to keep it from: a home deleted and recloned with
+no rename ever recorded has no `.moved-to` to make the clone an occupant, so
+the next reconcile stamps the clone's own identity into `.origin-ino`
+(`registry::write_origin`) and the record is still forgotten into it.
+**Reconciling this back to key-level evidence — re-pointing every resident
+on one key's match, or reading "the key's directory moved" as license to
+rewrite every record under it — is the vulnerability this replaced, not the
+cleanup**: that is exactly how an occupant's directory ends up owning
+another project's live session. A key's own sessions are the one place that
+still follows on lighter evidence than its own record: each is re-homed
+first by where its shell actually sits, among the directories carrying one
+of the key's own identities, and only once the shell has left by the
+identity it was started with (`home::own_follow`,
+`registry::record_start_identity`, written only when the session's
+socket is not there yet — a restart's reservation-driven reattach to a
+surviving master is a `Spawn` too, and rewriting it there would stamp
+whatever directory now stands at the URL, an occupant's included, as where
+a shell started that began somewhere else) — so a transient `cd` into any of those
+directories becomes a permanent re-home of that session, not a visit. That
+is spec-mandated, not a bug: the session's own evidence is retired the
+moment stronger evidence (its live shell) appears. A session with neither
+shell evidence nor a start identity stays with its current owner — its
+home, if it was never followed. Once that home is renamed no page lists
+it, and if a new directory then appears at the old name, that occupant's
+page lists it as its own and its Close Project ends it: the one hazard
+this leaves, which is why sessions alive before start identities existed
+are backfilled once, with the key's own recorded identity, while their
+key is unrenamed (`registry::backfill_start_identity`).
 
 **The rule:** "I could not determine X" is a third outcome, never folded into
 "X is false". Concretely:

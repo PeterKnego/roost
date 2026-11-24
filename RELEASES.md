@@ -10,6 +10,57 @@ added later never reaches the release page.
 Keep the newest section at the top, and say what a change means for someone
 running roost rather than what the diff did.
 
+## v0.9.0 — 2026-11-24 — chat with your Claude from a phone
+
+The headline is a phone-first chat view over a Claude that is already running
+in a roost terminal. Around it, the browser bridge comes to Firefox, a renamed
+or relocated worktree no longer loses its terminals, and a video opens as a
+video.
+
+- **Chat view (#211).** A 💬 icon on a terminal running Claude opens a second
+  view of the *same* Claude: full screen on a phone, a side panel on a desktop.
+  It shows the conversation from Claude Code's own transcript, with markdown
+  answers and tool calls you can expand, and turns permission prompts,
+  questions and the trust dialog into buttons, with a Stop button while Claude
+  works. What you type goes into the terminal, so the terminal stays the source
+  of truth.
+- **Phones (#207).** The key bar (esc, tab, arrows, ⏎, ^C, paste) follows a
+  terminal into any pane, and the file tree's header has an upload button,
+  since iOS Safari never opens the long-press menu.
+- **Videos play (#210).** `.mp4`, `.m4v`, `.mov` and `.webm` open in the
+  browser's own player, with seeking, on phones too, instead of "binary file".
+- **roost bridge for Firefox (#189).** The same tools, consent window and
+  handoff page as in Chrome. The release carries
+  `roost-extension-0.9.0-firefox.zip` (Firefox 140 or later), and
+  `roost-extension-0.9.0-webstore.zip`, laid out the way the Chrome Web Store
+  wants it (#175).
+- **Renaming a worktree no longer kills its terminals (#179, #180, #187,
+  #194).** Moving a project or worktree directory (`git worktree move`, `mv`)
+  used to look like a delete to roost's cleanup, which then ended every shell
+  working there. roost now tells a move from a delete by the directory's
+  identity, follows the move, and when it cannot tell, keeps the terminal.
+  A new directory created at the old name does not take over the old one's
+  terminals.
+- **Worktrees roost did not make (#181, #191).** A terminal follows its Claude
+  into a worktree only when that Claude actually goes there, so a subagent's
+  worktree no longer moves your tab. Any new worktree gets a banner that stays
+  until dismissed. A worktree outside roost's roots can be allowed in place,
+  one directory at a time, and opens like any other project.
+- **A new worktree gets your hooks (#205).** It inherits roost's notification
+  and worktree hooks from its main checkout, so its Claude notifies you.
+- **A Claude survives a container restart as a resume offer (#200).** A
+  terminal that was running Claude comes back with "Resume the Claude that was
+  here" instead of as a plain shell.
+- **IDE lock files are private (#186).** roost wrote `~/.claude/ide/*.lock`,
+  which holds the IDE socket's token, readable by your group under a 0002
+  umask. They are now 0600.
+- **Linux releases read directory birth time (#201).** The musl builds, which
+  are every Linux release and the container image, could not, so allowing an outside
+  worktree and following a renamed one quietly did nothing there.
+- **Container image (#197, #202).** It builds again, and its own `tini` is
+  PID 1.
+- **Dependencies updated (#208)**, including tungstenite 0.30 and ureq 3.
+
 ## v0.8.0 — 2026-10-13 — a roost Claude can use your own Chrome
 
 The headline is the browser bridge: with the roost extension in Chrome, a

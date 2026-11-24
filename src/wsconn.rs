@@ -136,7 +136,7 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // any page the user visits can drive this socket, and this socket can
     // write files. See spec §Security and src/term.rs's identical check.
     let allowed = crate::config::allowed_origins();
-    let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
+    let config = WebSocketConfig::default().max_message_size(Some(MAX_FRAME_BYTES));
     // Open through the handshake — the 101 and any refusal go out on this
     // object — and closed below, the moment a second writer exists.
     let gate = Gate::open();
@@ -271,6 +271,19 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // the same thread. A leaked subscriber is recoverable; a socket thread
     // wedged holding the hub lock takes the whole project with it.
     let unsub = UnsubGuard { hub: hub.clone(), id: id.clone() };
+    // #188 §3: opening a worktree's page dismisses its banner on the
+    // parent. After the first `State` and off this hub's lock, on its own
+    // thread: it may lock the *parent's* hub, and a socket thread holding
+    // one hub lock while taking another is the deadlock `for_project`'s
+    // comment above warns of. A page that is no worktree spawns nothing.
+    if let Some(parent) = crate::hub::worktree_parent(project, &dir) {
+        let (url, dir) = (project.to_string(), dir.clone());
+        let _ = std::thread::Builder::new().name("appeared-clear".into()).spawn(move || {
+            if std::panic::catch_unwind(|| crate::hub::clear_appeared_on_open(&parent, &dir)).is_err() {
+                eprintln!("roost: {url}: clearing its appeared banner panicked; it stays until dismissed");
+            }
+        });
+    }
     // Disk reads happen with the hub lock already dropped. Only a rel that
     // was Clean at snapshot time needs one — an edited buffer's text is
     // already in hand and reading its file too would be pure waste.

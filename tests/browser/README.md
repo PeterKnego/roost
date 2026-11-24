@@ -15,6 +15,7 @@ roost with real `dtach`.
 ```bash
 deno run -A tests/browser/reconnect.mjs   # terminal survives a dead connection
 deno run -A tests/browser/upload.mjs      # file upload and image paste
+deno run -A tests/browser/video.mjs     # a screencast plays in a video tab and seeks; the raw route answers ranges (needs ffmpeg)
 deno run -A tests/browser/paneicons.mjs   # the per-pane header controls
 deno run -A tests/browser/mdlinks.mjs     # markdown preview links/images, and the image-tab edit refusal
 deno run -A tests/browser/mdhtml.mjs    # a GitHub-style README's raw HTML: images fetch, details fold, nothing executes
@@ -38,8 +39,10 @@ deno run -A tests/browser/claudeterm.mjs # the ✻ button: a terminal with claud
 deno run -A tests/browser/resume.mjs     # the offer to continue the Claude a reboot interrupted (#18 step 2): where the button renders, and what each way of activating the placeholder asks for
 deno run -A tests/browser/claudemenu.mjs # the ✻ menu: New plus this project's past conversations, and no menu at all when there are none (needs its own HOME — the history is Claude Code's directory, not roost's)
 deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
+deno run -A tests/browser/longpress.mjs  # phone: a long-press is the tree's right-click; a folder can be sent to Claude; upload stays on the Files pane
 deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
 deno run -A tests/browser/worktree-rehome.mjs # Claude's WorktreeCreate hook end to end: ask, approve, re-home, close and fork (#156)
+deno run -A tests/browser/outside.mjs    # a worktree outside roost's roots: the persistent appeared banner, Allow… into a virtual URL, and Revoke — from the switcher and the overview (#188)
 deno run -A tests/browser/overview.mjs   # the front page (/): live session list, clicking one focuses it, ?at= reaches the picker, and selecting a project narrows/widens the session list
 deno run -A tests/browser/claudetab.mjs  # a terminal tab running a Claude wears the Claude mark: the /proc watcher, the data-claude attribute, and the CSS that turns it into a different picture
 deno run -A tests/browser/changes.mjs    # the Changes pane and the header chip follow the working tree, not just `.git/index`
@@ -68,6 +71,7 @@ deno run -A tests/browser/nodtach.mjs    # a host without dtach says so on the t
 deno run -A tests/browser/revert.mjs     # revert from the Changes pane and a Diff tab: the git menu, the disabled hints, cancel vs confirm, and the stash on disk (#125)
 deno run -A tests/browser/backup.mjs     # backing a workspace up and restoring it into a *different* project (#18 step 3) — needs its own HOME, like claudemenu.mjs
 deno run -A tests/browser/bridge.mjs     # the browser bridge (#161): the extension loaded in Chromium, roost mcp's chrome_* tools through consent, a forged call refused, and the handoff page both ways
+deno run -A tests/browser/bridge-firefox.mjs # the same bridge in a real Firefox (#177): the release's Firefox package over Marionette, the page backend that stands in for the DevTools protocol, and Firefox's limits asserted — needs $FIREFOX or firefox on PATH
 ```
 
 Each scenario is its own file and its own roost, so they can be run in any

@@ -251,6 +251,21 @@ pub enum Intent {
     /// every "finished" check at this moment; the row that offered the
     /// button is a hint, not an authorisation.
     RemoveWorktree { key: String },
+    /// Allow one git worktree outside roost's roots to open under
+    /// `<parent>/.claude/outside/<name>` (#188). `parent` is carried
+    /// explicitly rather than taken from the sending page: the switcher sits
+    /// in every page's header, sibling worktrees' included, so the sender is
+    /// not necessarily the parent. Every check — `parent` resolves, git lists
+    /// `path` as one of its non-main worktrees — is made against `parent`
+    /// itself, server-side, at this moment; the row is a hint.
+    AllowOutsideWorktree { parent: String, path: String },
+    /// Delete the allow record `name` under `parent`. Revocation touches no
+    /// session, layout or `.base`: the page stops resolving and a live
+    /// session stays alive.
+    RevokeOutsideWorktree { parent: String, name: String },
+    /// Drop `path` from this project's appeared list (#188 §3), for every
+    /// browser on the project, not just the one that clicked.
+    DismissAppeared { path: String },
     /// Tree visibility for this workspace, overriding the config file's
     /// `show_hidden` for everyone looking at this project. A workspace that
     /// has never been toggled carries `None` and follows the config instead —
@@ -642,6 +657,27 @@ pub struct WorkspaceView {
     /// never persisted (it is a read of the files, not workspace state).
     #[serde(default)]
     pub settings: SettingsView,
+    /// Worktrees that appeared and are not yet dealt with (`appeared.rs`),
+    /// oldest first. Filled by `hub::snapshot_event` from the hub's
+    /// in-memory copy of the persisted list, so a page that connects late,
+    /// or after a restart, still sees every banner.
+    #[serde(default)]
+    pub appeared: Vec<AppearedView>,
+}
+
+/// One entry of `WorkspaceView::appeared`, resolved for display. Built
+/// fork-free under the hub lock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AppearedView {
+    pub path: String,
+    pub branch: String,
+    /// The page to link to: the project under a root, or the virtual
+    /// outside URL of an allowed one. `None` when there is nowhere to go.
+    pub url: Option<String>,
+    /// No root contains `path`.
+    pub outside: bool,
+    /// An allow record names `path` and still resolves to it.
+    pub allowed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -665,6 +701,17 @@ pub enum Event {
     /// exactly that). Sent with `send_to` and never broadcast — one person's
     /// mis-click must not flash every window in the project.
     PathRefused { text: String, msg: String },
+    /// A terminal link that `resolve_terminal_path` refused, but that
+    /// `projects::project_for_abs` could place inside a *different* roost
+    /// project (#158 §3) — `project` is that project's url, `rel` the
+    /// file's path inside it, `line` the `:line` suffix the terminal text
+    /// carried, if any. Sent with `send_to` and never broadcast, for the
+    /// same reason `PathRefused` is: one terminal's click is not every
+    /// browser's business. The client renders "That's in `<project>` —
+    /// open", with the link navigating to the other project's page and
+    /// nothing opening here — the new page's own server confines the
+    /// `OpenPath` it sends once `?open=` is read there.
+    PathElsewhere { project: String, rel: String, line: Option<u32> },
     /// Results for one query. Sent with `send_to` and never broadcast: a
     /// query is one browser's business, and the overlay that asked is
     /// client-local by design.
@@ -690,6 +737,19 @@ pub enum Event {
     /// re-validate (`claudesess::valid_session_id`) before it ever reaches a
     /// command line.
     WorktreeReady { url: String, launch: Option<Launch>, fork: Option<String> },
+    /// The allow record is written; `url` is the virtual
+    /// `<parent>/.claude/outside/<name>` it now resolves under. Sent to the
+    /// clicker only — it is the one that asked and may navigate; every other
+    /// browser learns of the change through the refreshed snapshot and
+    /// `ProjectsChanged`.
+    OutsideAllowed { url: String },
+    /// The allow record `parent`/`name` is deleted. Sent to the clicker
+    /// only, after every switcher has heard `ProjectsChanged`: it is the
+    /// one event that means *this* revoke was handled, where a
+    /// `ProjectsChanged { parent }` can also come from a terminal spawn, a
+    /// prune, or a cold hub's seed, and waiting on that hid a later
+    /// `Error` (#188 final review).
+    OutsideRevoked { parent: String, name: String },
     /// Claude in `session` asked for worktree `worktree-<name>` through the
     /// hook and is blocked until a browser answers with `WorktreeAnswer`.
     /// Broadcast to every browser of the project; `id` is a server counter,
@@ -783,6 +843,19 @@ pub enum Event {
     /// R18 has by now also forgotten the re-home record, so the session is
     /// `Here` again. This event is only the explanation for why.
     WorktreeGone { worktree: String, session: String },
+    /// A worktree of this checkout that roost did not make has appeared —
+    /// `git worktree add` from any tool, at any path (#158 §2). Broadcast to
+    /// this project's browsers once per worktree; one that already existed
+    /// when the watcher started, or that roost itself is making, never sends
+    /// this. `url` is the worktree's roost project when its directory is one
+    /// under a root, `None` when it lies outside every root (the banner then
+    /// has nothing to link to).
+    WorktreeAppeared { path: String, branch: String, url: Option<String> },
+    /// A project or worktree directory was renamed, and its live terminals
+    /// followed it (#158 §5): `from` is the old URL, `to` the new one. Sent
+    /// to both projects' browsers once per rename — the old page gets a link
+    /// to the new one, the new page the explanation for its new tabs.
+    ProjectMoved { from: String, to: String },
     /// A browser tool call for this page to hand to the extension, unread.
     /// `payload` is opaque JSON text and `sig` its HMAC (`browser::sign`):
     /// the extension verifies the bytes it is given, so this page — which
@@ -868,6 +941,67 @@ mod tests {
         });
         assert!(s.contains(r#""fork":"864ee734-e3ab-434e-8278-745a850b16ad""#), "{s}");
         assert!(!s.contains("term3"), "the terminal name the dialog offered must never be on the wire here");
+    }
+
+    /// Pins the wire shape the switcher's Allow…/Revoke actions send: both
+    /// fields required, `parent` explicit (never inferred from the page).
+    #[test]
+    fn outside_worktree_intents_decode_and_require_their_fields() {
+        let i = decode(r#"{"t":"AllowOutsideWorktree","parent":"repo","path":"/home/u/scratch/wt"}"#).unwrap();
+        assert!(
+            matches!(i, Intent::AllowOutsideWorktree { ref parent, ref path } if parent == "repo" && path == "/home/u/scratch/wt"),
+            "got {i:?}"
+        );
+        let i = decode(r#"{"t":"RevokeOutsideWorktree","parent":"repo","name":"wt"}"#).unwrap();
+        assert!(
+            matches!(i, Intent::RevokeOutsideWorktree { ref parent, ref name } if parent == "repo" && name == "wt"),
+            "got {i:?}"
+        );
+        assert!(decode(r#"{"t":"AllowOutsideWorktree","path":"/x"}"#).is_err(), "parent is required");
+        assert!(decode(r#"{"t":"RevokeOutsideWorktree","parent":"repo"}"#).is_err(), "name is required");
+    }
+
+    /// The client sends exactly this shape; a renamed field would decode as
+    /// an error and the Dismiss button would do nothing.
+    ///
+    /// Revert-checked: with the variant's field serde-renamed to `p`, fails
+    /// — observed: ``called `Result::unwrap()` on an `Err` value: "missing
+    /// field `p`"``. Restored.
+    #[test]
+    fn dismiss_appeared_decodes_its_path() {
+        let i = decode(r#"{"t":"DismissAppeared","path":"/x/wt"}"#).unwrap();
+        assert!(matches!(i, Intent::DismissAppeared { ref path } if path == "/x/wt"), "got {i:?}");
+        assert!(decode(r#"{"t":"DismissAppeared"}"#).is_err(), "path is required");
+    }
+
+    /// `url` must encode as `null`, not vanish: the client branches on it.
+    ///
+    /// Revert-checked: with `skip_serializing_if = "Option::is_none"` on
+    /// `url`, fails — observed: `left:
+    /// "{\"path\":\"/o/wt\",\"branch\":\"side\",\"outside\":true,\"allowed\":false}"`.
+    /// Restored.
+    #[test]
+    fn appeared_view_encodes_every_field() {
+        let v = AppearedView { path: "/o/wt".into(), branch: "side".into(), url: None, outside: true, allowed: false };
+        let s = serde_json::to_string(&v).unwrap();
+        assert_eq!(s, r#"{"path":"/o/wt","branch":"side","url":null,"outside":true,"allowed":false}"#);
+    }
+
+    /// Revert-checked: with the variant's `name` field renamed to `wt`
+    /// (cp backup, restored), fails `left:
+    /// "{\"t\":\"OutsideRevoked\",\"parent\":\"repo\",\"wt\":\"wt\"}"` — the
+    /// client reads `ev.parent` and `ev.name`, so the wire names are the
+    /// contract.
+    #[test]
+    fn outside_revoked_encodes_parent_and_name() {
+        let s = encode(&Event::OutsideRevoked { parent: "repo".into(), name: "wt".into() });
+        assert_eq!(s, r#"{"t":"OutsideRevoked","parent":"repo","name":"wt"}"#);
+    }
+
+    #[test]
+    fn outside_allowed_encodes_its_url() {
+        let s = encode(&Event::OutsideAllowed { url: "repo/.claude/outside/wt".into() });
+        assert_eq!(s, r#"{"t":"OutsideAllowed","url":"repo/.claude/outside/wt"}"#);
     }
 
     #[test]
@@ -1015,6 +1149,34 @@ mod tests {
     fn worktree_gone_encodes_both_fields() {
         let s = encode(&Event::WorktreeGone { worktree: "repo/.claude/worktrees/w1".into(), session: "term3".into() });
         assert!(s.contains(r#""t":"WorktreeGone""#) && s.contains("w1") && s.contains("term3"));
+    }
+
+    /// The client branches on `url` being null, so `None` must encode as
+    /// `null` and not be skipped.
+    ///
+    /// Revert-checked: with `#[serde(skip_serializing_if =
+    /// "Option::is_none")]` on `url`, this fails — observed:
+    /// `{"t":"WorktreeAppeared","path":"/elsewhere/x","branch":"x"}`.
+    /// Restored.
+    #[test]
+    fn worktree_appeared_encodes_its_url_or_null() {
+        let s = encode(&Event::WorktreeAppeared { path: "/r/uc-rel".into(), branch: "docs/rel".into(), url: Some("uc-rel".into()) });
+        assert!(s.contains(r#""t":"WorktreeAppeared""#) && s.contains(r#""branch":"docs/rel""#) && s.contains(r#""url":"uc-rel""#), "{s}");
+        let s = encode(&Event::WorktreeAppeared { path: "/elsewhere/x".into(), branch: "x".into(), url: None });
+        assert!(s.contains(r#""url":null"#), "{s}");
+    }
+
+    /// The banner reads both fields by name; a rename of either would
+    /// leave it printing `undefined`.
+    ///
+    /// Revert-checked: with `#[serde(rename = "old")]` on `from`, fails —
+    /// observed `{"t":"ProjectMoved","old":"repo/.claude/worktrees/worktree-a",…}`.
+    /// Restored.
+    #[test]
+    fn project_moved_encodes_from_and_to() {
+        let s = encode(&Event::ProjectMoved { from: "repo/.claude/worktrees/worktree-a".into(), to: "repo/.claude/worktrees/worktree-b".into() });
+        assert!(s.contains(r#""t":"ProjectMoved""#), "{s}");
+        assert!(s.contains(r#""from":"repo/.claude/worktrees/worktree-a""#) && s.contains(r#""to":"repo/.claude/worktrees/worktree-b""#), "{s}");
     }
 
     #[test]
@@ -1172,6 +1334,26 @@ mod tests {
         assert!(s.contains(r#""t":"PathRefused""#), "got {s}");
         assert!(s.contains(r#""text":"src/gone.rs""#), "got {s}");
         assert!(s.contains(r#""msg":"cannot read src/gone.rs""#), "got {s}");
+    }
+
+    /// The client branches on `line` being present, so `None` must encode as
+    /// `null` and not be skipped — the same risk `worktree_appeared_encodes_its_url_or_null`
+    /// (Task 5) pins for `WorktreeAppeared.url`.
+    ///
+    /// Revert-checked: adding `#[serde(skip_serializing_if = "Option::is_none")]`
+    /// to `PathElsewhere.line` fails this test — observed:
+    /// `{"t":"PathElsewhere","project":"other","rel":"a.md"}` (no `"line"` key
+    /// at all, so the `Some` assertion below finds no `"line":7` and the
+    /// `None` assertion's `contains(r#""line":null"#)` also fails). Restored.
+    #[test]
+    fn path_elsewhere_encodes_its_line_or_null() {
+        let s = encode(&Event::PathElsewhere { project: "other".into(), rel: "a.md".into(), line: Some(7) });
+        assert!(
+            s.contains(r#""t":"PathElsewhere""#) && s.contains(r#""project":"other""#) && s.contains(r#""rel":"a.md""#) && s.contains(r#""line":7"#),
+            "{s}"
+        );
+        let s = encode(&Event::PathElsewhere { project: "other".into(), rel: "a.md".into(), line: None });
+        assert!(s.contains(r#""line":null"#), "{s}");
     }
 
     #[test]

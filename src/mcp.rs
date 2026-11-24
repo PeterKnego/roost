@@ -145,7 +145,7 @@ pub fn serve(input: impl BufRead, out: Out, who: Option<Identity>, broker: Broke
                     "protocolVersion": v,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "roost", "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": "chrome_* tools act in the user's own Chrome (their logins, their tabs) through the roost browser extension; each Claude session needs the user's consent once. handoff_* tools talk to whoever is on the project's roost handoff page, often Claude in Chrome.",
+                    "instructions": "chrome_* tools act in the user's own browser, Chrome or Firefox (their logins, their tabs), through the roost browser extension; each Claude session needs the user's consent once. handoff_* tools talk to whoever is on the project's roost handoff page, often Claude in Chrome.",
                 })));
             }
             "ping" => write_msg(&st.out, &ok(&id, json!({}))),
@@ -334,7 +334,7 @@ fn chrome_result(mut v: Value) -> Value {
 }
 
 fn tools() -> Vec<Value> {
-    let tab = json!({"type": "integer", "description": "Chrome tab id from chrome_tabs. Omitted: the tab this session last opened or used, else the active tab (never a roost tab)."});
+    let tab = json!({"type": "integer", "description": "Browser tab id from chrome_tabs. Omitted: the tab this session last opened or used, else the active tab (never a roost tab)."});
     let target = |extra: Value| {
         let mut props = json!({
             "tab_id": tab,
@@ -346,20 +346,20 @@ fn tools() -> Vec<Value> {
         }
         props
     };
-    const WHOSE: &str = "Acts in the USER'S OWN Chrome (their real logins and tabs) through the roost extension, not a headless browser; the user is asked to allow it once per Claude session.";
+    const WHOSE: &str = "Acts in the USER'S OWN browser, Chrome or Firefox (their real logins and tabs), through the roost extension, not a headless browser; the user is asked to allow it once per Claude session.";
     vec![
-        json!({"name": "chrome_tabs", "description": format!("List the user's open Chrome tabs (id, title, url, active). {WHOSE}"),
+        json!({"name": "chrome_tabs", "description": format!("List the user's open browser tabs (id, title, url, active). {WHOSE}"),
                "inputSchema": {"type": "object", "properties": {}}}),
-        json!({"name": "chrome_open", "description": format!("Open a URL in the user's Chrome, in a background window of its own, and wait for it to load. Returns the tab id. {WHOSE}"),
+        json!({"name": "chrome_open", "description": format!("Open a URL in the user's browser, in a tab group of its own, and wait for it to load. Returns the tab id. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": {
                    "url": {"type": "string"},
                    "new_tab": {"type": "boolean", "description": "Default true. False navigates the current tab instead."},
                    "tab_id": tab}, "required": ["url"]}}),
-        json!({"name": "chrome_screenshot", "description": format!("Screenshot the visible part of a tab in the user's Chrome. {WHOSE}"),
+        json!({"name": "chrome_screenshot", "description": format!("Screenshot the visible part of a tab in the user's browser. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": {"tab_id": tab}}}),
-        json!({"name": "chrome_read", "description": format!("Read a page in the user's Chrome: title, url, visible text, and numbered refs for links, buttons and inputs (use them with chrome_click/chrome_type), same-origin iframes included. {WHOSE}"),
+        json!({"name": "chrome_read", "description": format!("Read a page in the user's browser: title, url, visible text, and numbered refs for links, buttons and inputs (use them with chrome_click/chrome_type), same-origin iframes included. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": {"tab_id": tab, "max_chars": {"type": "integer", "description": "Text cap, default 20000."}}}}),
-        json!({"name": "chrome_click", "description": format!("Click an element (by ref from chrome_read, or a CSS selector) with a real mouse event — or a point x,y on the last chrome_screenshot, for what has no ref (a cross-origin iframe, a canvas). {WHOSE}"),
+        json!({"name": "chrome_click", "description": format!("Click an element (by ref from chrome_read, or a CSS selector) with a real mouse event — or a point x,y on the last chrome_screenshot, for what has no ref (a cross-origin iframe, a canvas). In Firefox the click is a dispatched event, which a few pages ignore; the result says so. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": target(json!({
                    "x": {"type": "number", "description": "With y: a point in the screenshot's own pixels, instead of ref or selector."},
                    "y": {"type": "number"}}))}}),
@@ -367,7 +367,7 @@ fn tools() -> Vec<Value> {
                "inputSchema": {"type": "object", "properties": target(json!({
                    "text": {"type": "string"},
                    "submit": {"type": "boolean", "description": "Press Enter afterwards."}})), "required": ["text"]}}),
-        json!({"name": "chrome_upload", "description": format!("Upload files from this host into a file input. Target the <input type=file> itself, or the button or drop area that opens the file picker: the picker is caught and filled, never shown. {WHOSE}"),
+        json!({"name": "chrome_upload", "description": format!("Upload files from this host into a file input. Target the <input type=file> itself, or (in Chrome) the button or drop area that opens the file picker: the picker is caught and filled, never shown. Firefox cannot catch a picker, so there target the input. {WHOSE}"),
                "inputSchema": {"type": "object", "properties": target(json!({
                    "paths": {"type": "array", "items": {"type": "string"}, "description": "Files to upload, absolute or relative to Claude's working directory; up to 20, 10 MB together."}})), "required": ["paths"]}}),
         json!({"name": "chrome_close", "description": format!("Close a tab this Claude session opened with chrome_open. Any other tab — the user's own, or one navigated with new_tab:false — is refused. {WHOSE}"),

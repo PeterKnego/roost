@@ -6,20 +6,38 @@
 // So nothing the page says is trusted: every call is HMAC-signed by the roost
 // server with a key the user pasted into the options page (and the page never
 // sees), and consent, grants and unsafe mode live here, in extension storage.
+//
+// The same file is Chrome's service worker and Firefox's background script.
+// Only the driving differs — Chrome has the DevTools protocol, Firefox does
+// not — and that sits behind `drive`, in drive-cdp.js and drive-page.js.
+// Chrome loads those through importScripts; Firefox lists them before this
+// file in the manifest's background.scripts, so importScripts is absent there.
 "use strict";
+
+if (typeof importScripts === "function") importScripts("page.js", "drive-cdp.js", "drive-page.js");
+
+/// Firefox has no chrome.debugger; that, and nothing else, picks the backend.
+const drive = chrome.debugger ? cdpDrive : pageDrive;
+/// Firefox match patterns take no port (bugs 1362809, 1468162), so a roost
+/// at http://127.0.0.1:8444 is matched as http://127.0.0.1/*. The worker still
+/// checks the sender's whole origin, port included, before acting.
+const NO_PORTS_IN_PATTERNS = chrome.runtime.getURL("").startsWith("moz-extension:");
+const originPattern = (o) => {
+  const u = new URL(o);
+  return NO_PORTS_IN_PATTERNS ? `${u.protocol}//${u.hostname}/*` : `${o}/*`;
+};
 
 const CONSENT_TIMEOUT_MS = 120000;
 const MAX_CALL_AGE_MS = 5 * 60 * 1000; // laptop and server clocks differ
-const IDLE_DETACH_MS = 5 * 60 * 1000;
 const MAX_SHOT_B64 = Math.floor(3.5 * 1024 * 1024 * 4 / 3); // 3.5 MB of JPEG
 const SHOT_LONG_SIDE = 2000;
 const LOAD_TIMEOUT_MS = 30000;
-const MAX_CONSOLE = 300;
 // Never driven, unsafe mode or not. A scheme list rather than an allow-list
 // of http(s) for tabs a user already has open; chrome_open allows only
 // http(s) on top of this.
-const DENIED_SCHEMES = ["chrome:", "chrome-extension:", "devtools:", "view-source:", "file:", "chrome-untrusted:", "edge:"];
-const DENIED_HOSTS = ["chromewebstore.google.com", "chrome.google.com"];
+const DENIED_SCHEMES = ["chrome:", "chrome-extension:", "devtools:", "view-source:", "file:", "chrome-untrusted:", "edge:",
+  "moz-extension:", "resource:", "jar:"];
+const DENIED_HOSTS = ["chromewebstore.google.com", "chrome.google.com", "addons.mozilla.org"];
 
 // ---- settings --------------------------------------------------------------
 
@@ -59,7 +77,7 @@ async function doSyncContentScripts() {
   const { origins } = await settings();
   try { await chrome.scripting.unregisterContentScripts({ ids: ["roost"] }); } catch { /* none yet */ }
   if (!origins.length) return;
-  const matches = origins.map((o) => `${o}/*`);
+  const matches = [...new Set(origins.map(originPattern))];
   await chrome.scripting.registerContentScripts([{
     id: "roost", matches, js: ["content.js"], runAt: "document_idle", allFrames: false, persistAcrossSessions: true,
   }]);
@@ -168,6 +186,9 @@ async function deniedReason(url) {
   let u;
   try { u = new URL(url); } catch { return null; } // about:blank and friends
   if (DENIED_SCHEMES.includes(u.protocol)) return `${u.protocol} pages are never driven`;
+  // Firefox's own pages are about: URLs (about:config, about:addons); only
+  // the blank page is fair game.
+  if (u.protocol === "about:" && u.href !== "about:blank") return "about: pages are never driven";
   if (DENIED_HOSTS.includes(u.hostname)) return `${u.hostname} is never driven`;
   const { deny, origins } = await settings();
   for (const d of deny) {
@@ -272,7 +293,9 @@ async function claudeTab(url, gk) {
   const groups = await session("groups", {});
   const project = grantProject(gk);
   const gkey = `${gk.split("|")[0]}|${project}`;
-  const group = groups[gkey] !== undefined ? await chrome.tabGroups.get(groups[gkey]).catch(() => null) : null;
+  // Tab groups are Chrome 89+ and Firefox 139+; below that, tabs go ungrouped.
+  const grouping = !!(chrome.tabGroups && chrome.tabs.group);
+  const group = grouping && groups[gkey] !== undefined ? await chrome.tabGroups.get(groups[gkey]).catch(() => null) : null;
   let windowId = group && group.windowId;
   if (!windowId) {
     const w = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
@@ -285,7 +308,9 @@ async function claudeTab(url, gk) {
     windowId = w.id;
   }
   const tab = await chrome.tabs.create({ windowId, url, active: follow });
-  if (group) {
+  if (!grouping) {
+    return tab;
+  } else if (group) {
     await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
   } else {
     const id = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } });
@@ -296,291 +321,11 @@ async function claudeTab(url, gk) {
   return tab;
 }
 
-// ---- the DevTools protocol -----------------------------------------------------------
-
-const attached = new Map(); // tabId -> { console: [], timer }
-
-async function attach(tabId) {
-  let st = attached.get(tabId);
-  if (!st) {
-    try {
-      await chrome.debugger.attach({ tabId }, "1.3");
-    } catch (e) {
-      // A worker restart forgets the map but not the attachment.
-      if (!/already attached/i.test(String(e && e.message))) throw e;
-    }
-    st = { console: [], timer: null, fresh: true };
-    attached.set(tabId, st);
-    await cdp(tabId, "Runtime.enable").catch(() => {});
-    await cdp(tabId, "Log.enable").catch(() => {});
-  } else {
-    st.fresh = false;
-  }
-  clearTimeout(st.timer);
-  st.timer = setTimeout(() => detach(tabId), IDLE_DETACH_MS);
-  return st;
-}
-
-function detach(tabId) {
-  const st = attached.get(tabId);
-  if (st) clearTimeout(st.timer);
-  attached.delete(tabId);
-  chrome.debugger.detach({ tabId }).catch(() => {});
-}
-
-const cdp = (tabId, method, params = {}) => chrome.debugger.sendCommand({ tabId }, method, params);
-
-function pushConsole(tabId, line) {
-  const st = attached.get(tabId);
-  if (!st) return;
-  st.console.push(line);
-  if (st.console.length > MAX_CONSOLE) st.console.shift();
-}
-
-chrome.debugger.onEvent.addListener((src, method, params) => {
-  if (method === "Runtime.consoleAPICalled") {
-    const text = (params.args || []).map((a) => a.value !== undefined ? String(a.value) : (a.description || a.type)).join(" ");
-    const f = params.stackTrace && params.stackTrace.callFrames[0];
-    pushConsole(src.tabId, `[${params.type}] ${text}${f ? ` (${f.url}:${f.lineNumber + 1})` : ""}`);
-  } else if (method === "Runtime.exceptionThrown") {
-    const d = params.exceptionDetails || {};
-    pushConsole(src.tabId, `[uncaught] ${(d.exception && d.exception.description) || d.text}${d.url ? ` (${d.url}:${d.lineNumber + 1})` : ""}`);
-  } else if (method === "Log.entryAdded") {
-    const e = params.entry;
-    pushConsole(src.tabId, `[${e.level}] ${e.text}${e.url ? ` (${e.url})` : ""}`);
-  }
-});
-// chrome_upload waits here for the page to open its file picker.
-const choosers = new Map(); // tabId -> resolve
-
-chrome.debugger.onEvent.addListener((src, method, params) => {
-  if (method !== "Page.fileChooserOpened") return;
-  const resolve = choosers.get(src.tabId);
-  if (resolve) { choosers.delete(src.tabId); resolve(params); }
-});
-
-// The user pressed Cancel on Chrome's "is debugging this browser" bar, or the
-// tab closed: forget it, and the next call attaches afresh.
-chrome.debugger.onDetach.addListener((src) => {
-  const st = attached.get(src.tabId);
-  if (st) clearTimeout(st.timer);
-  attached.delete(src.tabId);
-});
-
-async function evaluate(tabId, expression) {
-  const r = await cdp(tabId, "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
-  if (r.exceptionDetails) throw new Error((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text);
-  return r.result.value;
-}
-
 function withTimeout(p, ms, what) {
   return Promise.race([p, sleep(ms).then(() => { throw new Error(`${what} did not finish in ${ms / 1000} s`); })]);
 }
 
 // ---- tools -----------------------------------------------------------------------------
-
-// The page's documents: the top one and every same-origin iframe's, nested,
-// each with the offset that turns its client coordinates into the top
-// page's. A cross-origin frame's document cannot be reached and is skipped.
-const FRAMES = `const roostDocs = () => {
-  const out = [];
-  const walk = (doc, dx, dy) => {
-    out.push({ doc, dx, dy });
-    for (const f of doc.querySelectorAll('iframe,frame')) {
-      let d = null;
-      try { d = f.contentDocument; } catch {}
-      if (!d || !d.documentElement) continue;
-      const r = f.getBoundingClientRect();
-      if (!r.width || !r.height) continue;
-      walk(d, dx + r.left + f.clientLeft, dy + r.top + f.clientTop);
-    }
-  };
-  walk(document, 0, 0);
-  return out;
-};
-const roostFind = (ref, selector) => {
-  for (const f of roostDocs()) {
-    const el = ref !== null ? f.doc.querySelector('[data-roost-ref="' + ref + '"]') : f.doc.querySelector(selector);
-    if (el) return { el, f };
-  }
-  return null;
-};`;
-
-const findArgs = (args) => args.ref !== undefined && args.ref !== null
-  ? `${JSON.stringify(String(args.ref))}, null`
-  : `null, ${JSON.stringify(String(args.selector || ""))}`;
-
-const READ_SCRIPT = (maxChars) => `(() => {
-  ${FRAMES}
-  const sel = 'a[href],button,input:not([type=hidden]),textarea,select,summary,[role=button],[role=link],[role=checkbox],[role=tab],[role=option],[role=gridcell],[contenteditable=""],[contenteditable=true]';
-  const docs = roostDocs();
-  const out = [];
-  let n = 0;
-  let text = '';
-  for (const { doc } of docs) {
-    doc.querySelectorAll('[data-roost-ref]').forEach((e) => e.removeAttribute('data-roost-ref'));
-    if (doc.body) text += (text ? '\\n' : '') + doc.body.innerText;
-    for (const el of doc.querySelectorAll(sel)) {
-      const r = el.getBoundingClientRect();
-      const cs = getComputedStyle(el);
-      if (!r.width || !r.height || cs.visibility === 'hidden' || cs.display === 'none') continue;
-      if (++n > 400) break;
-      el.setAttribute('data-roost-ref', String(n));
-      const label = (el.getAttribute('aria-label') || el.innerText || el.placeholder || el.value || el.name || el.title || el.getAttribute('href') || '').trim().replace(/\\s+/g, ' ').slice(0, 80);
-      const kind = el.tagName.toLowerCase() + (el.type && el.tagName === 'INPUT' ? ':' + el.type : '') + (doc === document ? '' : ' (in frame)');
-      out.push('[' + n + '] ' + kind + ' "' + label + '"');
-    }
-  }
-  return { title: document.title, url: location.href, text: text.slice(0, ${maxChars}), truncated: text.length > ${maxChars}, elements: out };
-})()`;
-
-const LOCATE_SCRIPT = (args) => `(() => {
-  ${FRAMES}
-  const hit = roostFind(${findArgs(args)});
-  if (!hit) return null;
-  const { el } = hit;
-  el.scrollIntoView({ block: 'center', inline: 'center' });
-  // Each enclosing frame too, outermost last, or the element can sit in
-  // view inside a frame that is itself scrolled out of the page.
-  for (let w = el.ownerDocument.defaultView; w.frameElement; w = w.parent) w.frameElement.scrollIntoView({ block: 'center', inline: 'center' });
-  const r = el.getBoundingClientRect();
-  let dx = 0, dy = 0;
-  for (let w = el.ownerDocument.defaultView; w.frameElement; w = w.parent) {
-    const fr = w.frameElement.getBoundingClientRect();
-    dx += fr.left + w.frameElement.clientLeft;
-    dy += fr.top + w.frameElement.clientTop;
-  }
-  return { x: dx + r.left + r.width / 2, y: dy + r.top + r.height / 2, what: el.tagName.toLowerCase() + ' "' + (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 60) + '"' };
-})()`;
-
-// Select the focused field's whole content, so the text typed next replaces it.
-const SELECT_ALL_SCRIPT = `(() => {
-  let el = document.activeElement;
-  // Focus inside a same-origin iframe shows here as the iframe itself.
-  while (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME')) {
-    let d = null;
-    try { d = el.contentDocument; } catch {}
-    if (!d) break;
-    el = d.activeElement;
-  }
-  if (!el) return false;
-  if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') { try { el.select(); } catch {} return true; }
-  if (el.isContentEditable) {
-    const range = el.ownerDocument.createRange();
-    range.selectNodeContents(el);
-    const sel = el.ownerDocument.getSelection();
-    sel.removeAllRanges();
-    sel.addRange(range);
-    return true;
-  }
-  return false;
-})()`;
-
-// Puts the files into the file input `this` the way a person picking them
-// would leave it, then tells the page, which listens for change (React too).
-// The input may sit in a same-origin iframe while this runs in the top
-// frame, so File, DataTransfer and Event come from the input's own window:
-// objects from the top frame's realm fail the iframe's instanceof checks
-// (Wix's uploader then reads no URI off the file).
-const SET_FILES = `function (files) {
-  const w = this.ownerDocument.defaultView || window;
-  const dt = new w.DataTransfer();
-  for (const f of files) {
-    const bin = atob(f.data);
-    const bytes = new w.Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    dt.items.add(new w.File([bytes], f.name, { type: f.mime }));
-  }
-  this.files = dt.files;
-  this.dispatchEvent(new w.Event('input', { bubbles: true }));
-  this.dispatchEvent(new w.Event('change', { bubbles: true }));
-  return this.files.length;
-}`;
-
-// The located element itself when it is a file input, else null.
-const FILE_INPUT_SCRIPT = (args) => `(() => {
-  ${FRAMES}
-  const hit = roostFind(${findArgs(args)});
-  const el = hit && hit.el;
-  return el && el.tagName === 'INPUT' && el.type === 'file' ? el : null;
-})()`;
-
-// The file input to fill: the target itself, or the one whose picker a
-// click on the target opens. The picker is intercepted, so no dialog ever
-// appears in front of the user.
-async function fileInput(tabId, args, at) {
-  const direct = await cdp(tabId, "Runtime.evaluate", { expression: FILE_INPUT_SCRIPT(args) });
-  if (direct.result && direct.result.objectId) return { objectId: direct.result.objectId, multiple: null };
-  await cdp(tabId, "Page.enable");
-  await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: true });
-  try {
-    const opened = new Promise((resolve) => choosers.set(tabId, resolve));
-    await click(tabId, at.x, at.y);
-    const ev = await withTimeout(opened, 5000, "a file picker opening").finally(() => choosers.delete(tabId));
-    const { object } = await cdp(tabId, "DOM.resolveNode", { backendNodeId: ev.backendNodeId });
-    return { objectId: object.objectId, multiple: ev.mode === "selectMultiple" };
-  } catch (e) {
-    throw new Error(/did not finish/.test(String(e && e.message))
-      ? "clicking it opened no file picker — target the <input type=file> or the button that opens it"
-      : e.message);
-  } finally {
-    await cdp(tabId, "Page.setInterceptFileChooserDialog", { enabled: false }).catch(() => {});
-  }
-}
-
-async function locate(tabId, args) {
-  if ((args.ref === undefined || args.ref === null) && !args.selector) throw new Error("pass ref (from chrome_read) or selector");
-  const at = await evaluate(tabId, LOCATE_SCRIPT(args));
-  if (!at) throw new Error(args.selector ? `nothing matches ${args.selector}` : `no element with ref ${args.ref} — call chrome_read again, refs change when the page does`);
-  return at;
-}
-
-async function click(tabId, x, y) {
-  for (const type of ["mouseMoved", "mousePressed", "mouseReleased"]) {
-    await cdp(tabId, "Input.dispatchMouseEvent", { type, x, y, button: "left", clickCount: type === "mouseMoved" ? 0 : 1 });
-  }
-}
-
-// chrome_screenshot shrinks the viewport by this factor (device pixels,
-// capped to SHOT_LONG_SIDE); a point on the image divided by it is a CSS
-// pixel in the viewport, which is what Input.dispatchMouseEvent takes.
-async function shotScale(tabId) {
-  const m = await cdp(tabId, "Page.getLayoutMetrics");
-  const vp = m.cssVisualViewport || m.visualViewport;
-  const dpr = (await evaluate(tabId, "devicePixelRatio")) || 1;
-  return dpr * Math.min(1, SHOT_LONG_SIDE / (Math.max(vp.clientWidth, vp.clientHeight) * dpr));
-}
-
-async function screenshot(tab) {
-  // A background tab does not paint; make it the visible one in its window,
-  // and with follow off, hand the user's own tab back afterwards.
-  let restore = null;
-  if (!tab.active) {
-    if (!(await settings()).follow) [restore] = await chrome.tabs.query({ active: true, windowId: tab.windowId });
-    await chrome.tabs.update(tab.id, { active: true });
-    await sleep(250);
-  }
-  try {
-    return await capture(tab);
-  } finally {
-    if (restore) await chrome.tabs.update(restore.id, { active: true }).catch(() => {});
-  }
-}
-
-async function capture(tab) {
-  await attach(tab.id);
-  await cdp(tab.id, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
-  const m = await cdp(tab.id, "Page.getLayoutMetrics");
-  const vp = m.cssVisualViewport || m.visualViewport;
-  const dpr = (await evaluate(tab.id, "devicePixelRatio")) || 1;
-  const scale = Math.min(1, SHOT_LONG_SIDE / (Math.max(vp.clientWidth, vp.clientHeight) * dpr));
-  const clip = { x: vp.pageX, y: vp.pageY, width: vp.clientWidth, height: vp.clientHeight, scale };
-  for (const quality of [70, 50, 35]) {
-    const r = await withTimeout(cdp(tab.id, "Page.captureScreenshot", { format: "jpeg", quality, clip, captureBeyondViewport: false }), 15000, "the screenshot");
-    if (r.data.length <= MAX_SHOT_B64) return r.data;
-  }
-  throw new Error("the screenshot is too large even at low quality");
-}
 
 async function runTool(gk, tool, args) {
   switch (tool) {
@@ -619,84 +364,53 @@ async function runTool(gk, tool, args) {
       const tab = await resolveTab(args, gk);
       await guard(tab);
       await rememberTab(gk, tab.id);
-      const data = await screenshot(tab);
+      const data = await drive.screenshot(tab);
       return { image: { data, mimeType: "image/jpeg" }, tab_id: tab.id, url: tab.url, title: tab.title };
     }
     case "chrome_read": {
       const tab = await resolveTab(args, gk);
       await guard(tab);
       await rememberTab(gk, tab.id);
-      await attach(tab.id);
       const max = Math.max(1000, Math.min(Number(args.max_chars) || 20000, 100000));
-      const r = await evaluate(tab.id, READ_SCRIPT(max));
+      const r = await drive.read(tab, max);
       return { tab_id: tab.id, ...r };
     }
     case "chrome_click": {
       const tab = await resolveTab(args, gk);
       await guard(tab);
       await rememberTab(gk, tab.id);
-      await attach(tab.id);
-      let at;
-      if (Number.isFinite(args.x) && Number.isFinite(args.y)) {
-        // A point on the last screenshot: for what refs cannot reach, such
-        // as a cross-origin iframe or a canvas.
-        const k = await shotScale(tab.id);
-        at = { x: args.x / k, y: args.y / k, what: `point ${args.x},${args.y} on the screenshot` };
-      } else {
-        at = await locate(tab.id, args);
-      }
-      await click(tab.id, at.x, at.y);
+      const r = await drive.click(tab, args);
       await sleep(300);
       const now = await chrome.tabs.get(tab.id);
-      return { clicked: at.what, tab_id: tab.id, url: now.url };
+      return { clicked: r.what, tab_id: tab.id, url: now.url, note: r.note };
     }
     case "chrome_type": {
       const tab = await resolveTab(args, gk);
       await guard(tab);
       await rememberTab(gk, tab.id);
-      await attach(tab.id);
-      const at = await locate(tab.id, args);
-      await click(tab.id, at.x, at.y);
-      // Typing replaces what the field holds, the way a person selects all
-      // first: insertText alone lands at the caret, so a textarea that
-      // already has text (or an input that does not select on focus) would
-      // end up with the old and the new run together.
-      await evaluate(tab.id, SELECT_ALL_SCRIPT);
-      await cdp(tab.id, "Input.insertText", { text: String(args.text ?? "") });
-      if (args.submit) {
-        const key = { key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
-        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyDown", text: "\r", ...key });
-        await cdp(tab.id, "Input.dispatchKeyEvent", { type: "keyUp", ...key });
-        await sleep(300);
-      }
-      return { typed_into: at.what, tab_id: tab.id, submitted: !!args.submit };
+      const r = await drive.type(tab, args);
+      if (args.submit) await sleep(300);
+      return { typed_into: r.what, tab_id: tab.id, submitted: !!args.submit, note: r.note };
     }
     case "chrome_upload": {
       const tab = await resolveTab(args, gk);
       await guard(tab);
       await rememberTab(gk, tab.id);
-      await attach(tab.id);
       const files = Array.isArray(args.files) ? args.files : [];
       if (!files.length) throw new Error("no files to upload");
-      const at = await locate(tab.id, args);
-      const input = await fileInput(tab.id, args, at);
-      if (input.multiple === false && files.length > 1) throw new Error(`that picker takes one file, not ${files.length}`);
-      const r = await cdp(tab.id, "Runtime.callFunctionOn", {
-        objectId: input.objectId, functionDeclaration: SET_FILES, arguments: [{ value: files }], returnByValue: true,
-      });
-      if (r.exceptionDetails) throw new Error((r.exceptionDetails.exception && r.exceptionDetails.exception.description) || r.exceptionDetails.text);
+      const r = await drive.upload(tab, args, files);
       await sleep(300);
-      return { uploaded: files.map((f) => f.name), into: at.what, tab_id: tab.id };
+      return { uploaded: files.map((f) => f.name), into: r.what, tab_id: tab.id };
     }
     case "chrome_console": {
       const tab = await resolveTab(args, gk);
       await guard(tab);
       await rememberTab(gk, tab.id);
-      const st = await attach(tab.id);
+      const r = await drive.console(tab);
       return {
         tab_id: tab.id,
-        messages: st.console.slice(),
-        note: st.fresh ? "collection started just now; reproduce the problem, then call chrome_console again" : undefined,
+        messages: r.messages,
+        note: r.fresh ? "collection started just now; reproduce the problem, then call chrome_console again" : r.note,
       };
     }
     case "chrome_close": {

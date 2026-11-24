@@ -52,11 +52,14 @@ services:
 
     # --- Least privilege, where it buys something ------------------------
     cap_drop: [ALL]
-    # PID 1 that reaps: dtach masters reparent to it by design.
-    init: true
 
     # NOT set, on purpose, and each is a decision rather than an omission:
     #
+    #   init: true          the image's ENTRYPOINT is already tini, which must
+    #                       be PID 1 to reap the dtach masters that reparent to
+    #                       it. Docker's init in front of it made tini a child
+    #                       that reaped nothing and warned on every start
+    #                       (#199); `docker run --init` is the same mistake.
     #   read_only: true     the product installs toolchains and compiles. Note
     #                       that a writable rootfs is not what makes an install
     #                       survive — anything in /usr is gone at the next `up`

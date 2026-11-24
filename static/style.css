@@ -117,6 +117,16 @@ header .vsep { width: 1px; height: 16px; background: var(--border); margin: 0 6p
 .wtf { color: var(--muted); font-size: 12px; }
 .wtf.on { color: var(--fg); }
 .wtremove { font: inherit; font-size: 12px; cursor: pointer; background: none; border: 1px solid var(--muted); border-radius: 3px; }
+/* #188's two controls on a worktree outside every root, and the marker on
+   an allowed one's row. Modelled on .wtremove. Allow… sits beside a row
+   that is dimmed because it cannot be opened, and the button is the way to
+   open it, so it is never dimmed with the row — see .ovrow.unreachable. */
+.wtallow, .wtrevoke { font: inherit; font-size: 12px; cursor: pointer; background: none;
+                      border: 1px solid var(--muted); border-radius: 3px; color: var(--fg);
+                      opacity: 1; flex: none; }
+.wtallow { border-color: var(--accent); }
+.wtallow:hover, .wtrevoke:hover { background: var(--bg); }
+.wtstrip .wt.outside::after, .ovrow.outside .ovname::after { content: " · outside"; color: var(--muted); font-size: 12px; }
 .wtadd { font: inherit; font-size: 13px; cursor: pointer; background: none; border: 1px solid var(--muted); border-radius: 3px;
          align-self: flex-start; margin-top: 2px; padding: 2px 8px; color: var(--fg); }
 .wtadd:hover { background: var(--bg); }
@@ -239,6 +249,17 @@ main { flex: 1; min-height: 0; }
 @media (max-width: 640px) {
   .content > .pdfview { display: none; }
   .content > .pdfopen { align-self: stretch; padding: 14px 16px; min-height: 44px; font-size: 16px; }
+}
+/* A video tab: the player takes what is left under the path, letterboxed,
+   at any width — phones play inline (playsinline), so there is no link-only
+   layout as for a PDF. */
+.content:has(> .vidview) { display: flex; flex-direction: column; overflow: hidden; }
+.content > .vidview { flex: 1 1 auto; min-height: 0; width: 100%; background: #000; object-fit: contain; }
+.content > .vidopen { align-self: flex-end; padding: 6px 10px; font-size: 13px; color: var(--accent, #548af7);
+  text-decoration: none; min-height: 32px; box-sizing: border-box; }
+.content > .vidopen:hover, .content > .vidopen:active { text-decoration: underline; }
+@media (max-width: 640px) {
+  .content > .vidopen { padding: 12px 16px; min-height: 44px; font-size: 15px; }
 }
 /* Inset from the card edge rather than bleeding into it: the fit addon sizes
    the grid from the host's *inner* box, so padding costs a column, not a
@@ -458,6 +479,15 @@ main { flex: 1; min-height: 0; }
    no "content" to prepend into), so this variant floats above everything
    instead of the .conflict base's normal in-flow placement. */
 .conflict.error-banner { position: fixed; top: 12px; right: 12px; z-index: 1000; max-width: 420px; }
+/* #188's appeared banners stay until dismissed, so they get their own
+   corner rather than sitting under the transient ones at the top. */
+#appeared { position: fixed; bottom: 12px; right: 12px; z-index: 999; max-width: 420px;
+            display: flex; flex-direction: column; gap: 6px; }
+#appeared .conflict { margin: 0; }
+#appeared .conflict a { color: var(--accent); }
+/* The persistent note on an allowed outside worktree's page. */
+#outsidenote { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+               color: var(--warn, #d79921); font-size: 12px; font-family: var(--mono); }
 /* showClaudeHere's prompt: .conflict already supplies the border/padding and
    the button margin, so this only overrides what makes the "start in a new
    worktree" choice read as the recommended one. */
@@ -888,6 +918,11 @@ header .roots .root + .root::before { content: ""; display: inline-block; width:
 .ovrow.current { background: var(--tab-on); }
 .ovrow.child { padding-left: 22px; }
 .ovrow.unreachable { opacity: .35; }
+/* An unopenable outside row carrying Allow…: opacity on the <li> would dim
+   the button with it (a child cannot be less transparent than its parent),
+   so that row is dimmed by colour instead and the button stays readable. */
+.ovrow.unreachable:has(.wtallow) { opacity: 1; color: var(--muted); }
+.ovrow.unreachable:has(.wtallow) > :not(.wtallow) { opacity: .5; }
 #ovprojects .branch { color: var(--muted); font-size: 12px; }
 .ovcaret { display: inline-block; width: 1em; flex: none; color: var(--muted); cursor: pointer; }
 .ovcaret.placeholder { cursor: default; }
@@ -1321,7 +1356,7 @@ header button.proj:hover svg { opacity: 1; }
                          border-radius: 50%; background: var(--accent, #d29922); }
 
 /* The terminal key bar. Present in the DOM at every width, shown only on a
-   phone with the terminal pane in front — see the phone block below. */
+   phone with a terminal in front — see the phone block below. */
 #termkeys { display: none; align-items: stretch; gap: 4px; padding: 4px 4px 0;
             background: var(--tool); }
 #termkeys button { flex: 1; min-width: 0; min-height: 44px; border: 1px solid var(--border);
@@ -1418,12 +1453,15 @@ header button.proj:hover svg { opacity: 1; }
   #grid > .divider { display: none; }
 
   #mobilebar { display: flex; }
-  /* Only with the terminal in front: these keys mean nothing over a file tree,
-     and the screen is the scarcest thing here. */
-  body[data-mpane="3"] #termkeys { display: flex; }
+  /* Only with a terminal in front: these keys mean nothing over a file tree,
+     and the screen is the scarcest thing here. `termfront` is set by app.js's
+     `syncTermKeys` from the front pane's active tab, not from the pane's
+     number — a terminal can be in any pane, and a Claude opened from the
+     file pane's ✻ used to come up with no keys at all. */
+  body.termfront #termkeys { display: flex; }
   /* The keys sit inside the frame the grid measures, so the pane gives up
      their height rather than the page growing past the viewport. */
-  body[data-mpane="3"] #grid {
+  body.termfront #grid {
     height: calc(100vh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
     height: calc(100dvh - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
     height: calc(var(--vvh, 100dvh) - var(--header-h, 36px) - var(--mobilebar-h, 56px) - var(--termkeys-h, 52px));
@@ -1633,5 +1671,137 @@ header button.proj:hover svg { opacity: 1; }
       minmax(200px, 1fr)
       var(--divider)
       minmax(0, min(var(--right-w, 520px), 38vw));
+  }
+}
+
+/* ============================== chat view ============================== */
+/* static/chat.js. A second view of a Claude terminal: the conversation from
+   its transcript, menus as buttons, a real textarea to type in. On a phone it
+   takes the whole visible viewport — header, pane switcher and key bar are
+   covered, because talking to Claude is the job there — and it follows the
+   soft keyboard the same way the workspace frame does (--vvtop/--vvh, written
+   by watchKeyboard). On a desktop it is a panel on the right with the
+   workspace still beside it. */
+#chat { position: fixed; z-index: 50; right: 0; top: 0; bottom: 0;
+        width: min(720px, 100vw); display: flex; flex-direction: column;
+        background: var(--bg); color: var(--fg); border-left: 1px solid var(--border);
+        box-shadow: -8px 0 24px rgba(0,0,0,.25); }
+#chat[hidden] { display: none; }
+.chathead { display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+            border-bottom: 1px solid var(--border); background: var(--tool); }
+.chathead button, .chatmode { min-height: 44px; min-width: 44px; border: 1px solid var(--border);
+            border-radius: 8px; background: var(--bg2); color: var(--fg); font: inherit; cursor: pointer;
+            padding: 0 10px; -webkit-tap-highlight-color: transparent; }
+.chathead button:active, .chatmode:active { background: var(--tab-hover); }
+.chattitle { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chatmode { display: inline-flex; align-items: center; font-size: 12px; color: var(--muted); }
+.chatmode[hidden] { display: none; }
+.chatbanner { padding: 8px 12px; background: var(--bg2); border-bottom: 1px solid var(--border);
+              color: var(--muted); font-size: 14px; }
+.chatbanner button { margin-left: 6px; min-height: 36px; border: 1px solid var(--border); border-radius: 8px;
+                     background: var(--bg); color: var(--fg); font: inherit; padding: 0 10px; }
+/* The scroller. Native scrolling with momentum, contained so a fling at the
+   end does not drag the page under it. */
+.chatlog { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain;
+           -webkit-overflow-scrolling: touch; padding: 12px 12px 4px; scroll-behavior: auto;
+           display: flex; flex-direction: column; gap: 10px; }
+.chatlog > * { max-width: 100%; }
+.cmsg { line-height: 1.5; overflow-wrap: anywhere; }
+.cuser { align-self: flex-end; max-width: 88%; }
+.cuser .cbubble { white-space: pre-wrap; background: var(--accent); color: var(--bg);
+                  padding: 8px 12px; border-radius: 14px 14px 4px 14px; }
+.cuser .cbubble a { color: inherit; text-decoration: underline; }
+/* github-markdown-css pads .markdown-body for a page; a message is not one. */
+#chat .casst > .markdown-body { padding: 0; margin: 0; max-width: 100%; min-width: 0; font-size: 15px;
+         background: transparent !important; color: var(--fg) !important; }
+.casst .markdown-body > :first-child { margin-top: 0; }
+.casst .markdown-body > :last-child { margin-bottom: 0; }
+.casst pre { overflow-x: auto; max-width: 100%; }
+.casst table { display: block; overflow-x: auto; }
+.chatlog a, .chatlive a { color: var(--accent); }
+.clink, #chat code a, #chat .casst code a { color: var(--accent); text-decoration: underline dotted; cursor: pointer; }
+.ctool { border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); font-size: 13px; }
+.ctoolhead { display: flex; gap: 6px; align-items: baseline; width: 100%; text-align: left; min-height: 36px;
+             padding: 6px 10px; border: 0; background: transparent; color: var(--fg); font: inherit; cursor: pointer; }
+.ctoolst { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); align-self: center; }
+.ctoolst.ok { background: #3fb950; }
+.ctoolst.err { background: #f85149; }
+.ctoolst.run { animation: cpulse 1s ease-in-out infinite; }
+.ctoolname { flex: none; font-weight: 600; }
+.ctoolsum { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+            font-family: var(--mono, ui-monospace, monospace); color: var(--muted); }
+.ctoolout { display: none; margin: 0; padding: 8px 10px; border-top: 1px solid var(--border);
+            max-height: 40vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+            font: 12px/1.4 var(--mono, ui-monospace, monospace); }
+.ctool.open .ctoolout { display: block; }
+.cnote { align-self: center; font-size: 12px; color: var(--muted); white-space: pre-wrap; max-width: 92%; }
+.chatdown { position: absolute; right: 16px; bottom: 140px; width: 44px; height: 44px; border-radius: 50%;
+            border: 1px solid var(--border); background: var(--bg2); color: var(--fg); font-size: 18px;
+            box-shadow: 0 2px 8px rgba(0,0,0,.3); }
+.chatdown[hidden] { display: none; }
+.chatlive:empty { display: none; }
+.chatlive { padding: 8px 12px; border-top: 1px solid var(--border); max-height: 55%; overflow-y: auto; }
+.cprompt { display: flex; flex-direction: column; gap: 6px; }
+.cpctx { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.cpq { font-weight: 600; margin-bottom: 2px; }
+.cpopt, .cpesc { display: flex; flex-direction: column; align-items: flex-start; text-align: left; min-height: 44px;
+                 padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2);
+                 color: var(--fg); font: inherit; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+.cpopt.sel { border-color: var(--accent); }
+.cpopt:active, .cpesc:active { background: var(--tab-hover); }
+.cpopt:disabled { opacity: .5; }
+.cpdetail { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.cpesc { align-items: center; color: var(--muted); }
+.cbusy { display: flex; align-items: center; gap: 10px; color: var(--muted); }
+.cbusy button { margin-left: auto; min-height: 40px; min-width: 64px; border: 1px solid var(--border);
+                border-radius: 8px; background: var(--bg2); color: var(--fg); font: inherit; }
+.cspin { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); animation: cpulse 1s ease-in-out infinite; }
+@keyframes cpulse { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .cspin, .ctoolst.run { animation: none; } }
+.chatkeys { display: flex; gap: 4px; padding: 4px 8px 0; }
+.chatkeys[hidden] { display: none; }
+.chatkeys button { flex: 1; min-width: 0; min-height: 44px; border: 1px solid var(--border); border-radius: 8px;
+                   background: var(--bg2); color: var(--fg); font: inherit; font-size: 13px; }
+.chatkeys button:active { background: var(--tab-hover); }
+.chatform { display: flex; align-items: flex-end; gap: 6px; padding: 8px;
+            padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px)); }
+.chatinput { flex: 1; min-width: 0; resize: none; max-height: 40vh; min-height: 44px; padding: 10px 12px;
+             border: 1px solid var(--border); border-radius: 18px; background: var(--bg2); color: var(--fg);
+             font: inherit; font-size: 16px; line-height: 1.35; }
+.chatatts { display: flex; gap: 6px; padding: 6px 8px 0; overflow-x: auto; }
+.chatatts[hidden] { display: none; }
+.chatatt { flex: none; display: flex; align-items: center; gap: 6px; max-width: 220px; min-height: 44px;
+           padding: 4px 10px 4px 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2);
+           font-size: 13px; }
+.chatatt img { width: 36px; height: 36px; object-fit: cover; border-radius: 6px; }
+.chatatticon { width: 36px; text-align: center; font-size: 20px; }
+.chattname { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chattstate { flex: none; color: var(--muted); }
+.chatatt.ok .chattstate { color: var(--accent); }
+.chatatt.err { border-color: var(--error, #e5534b); }
+.chatatt.err .chattstate { color: var(--error, #e5534b); max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chatsend, .chatmore, .chatattach { flex: none; width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--border);
+                       background: var(--bg2); color: var(--fg); font-size: 18px; cursor: pointer; }
+.chatsend { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+.chatsend:active, .chatmore:active, .chatattach:active { filter: brightness(.85); }
+.chatflash { position: absolute; left: 50%; bottom: 90px; transform: translateX(-50%); max-width: 90%;
+             padding: 8px 12px; border-radius: 8px; background: var(--fg); color: var(--bg); font-size: 14px; }
+#chatpill { position: fixed; z-index: 45; right: 12px; bottom: calc(76px + env(safe-area-inset-bottom, 0px));
+            min-height: 44px; padding: 0 16px; border-radius: 22px; border: 1px solid var(--accent);
+            background: var(--accent); color: var(--bg); font: inherit; font-weight: 600;
+            box-shadow: 0 2px 10px rgba(0,0,0,.35); }
+#chatpill[hidden] { display: none; }
+@media (max-width: 900px) {
+  #chat { left: 0; width: auto; border-left: 0; box-shadow: none;
+          top: var(--vvtop, 0px); bottom: auto; height: var(--vvh, 100dvh); }
+}
+
+/* A long-press on a tree or Changes row opens roost's menu (app.js,
+   "long-press = right-click"), so the system's own link callout and text
+   selection must not open on top of it. Touch screens only. */
+@media (hover: none) {
+  .content[data-kind="Tree"] a[data-rel], .content[data-kind="Tree"] summary,
+  .content[data-kind="Changes"] a[data-rel] {
+    -webkit-touch-callout: none; -webkit-user-select: none; user-select: none;
   }
 }

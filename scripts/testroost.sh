@@ -41,6 +41,17 @@ ROOTS=${ROOST_TEST_ROOTS:-$HOME/roost-test/roots}
 phase "test roost"
 need cargo "install rust"; need dtach "apt install dtach"; need git "install git"
 
+# roost binds its hook and browser-bridge sockets under the state directory,
+# and a Unix socket path has a hard kernel limit (sun_path: 108 bytes on
+# Linux, 104 on macOS, the trailing NUL included). Past it roost only warns
+# and serves on without them — which reads as a working instance until the
+# worktree ask or the browser bridge is the thing being checked. So refuse
+# up front, naming the override, rather than start a quietly partial one.
+case "$(uname -s)" in Darwin) SUN_MAX=104 ;; *) SUN_MAX=108 ;; esac
+LONGEST="$STATE/hook/browser.sock"
+[ "${#LONGEST}" -lt "$SUN_MAX" ] ||
+  die "ROOST_TEST_STATE is too long for a Unix socket: $LONGEST is ${#LONGEST} bytes, the limit is $((SUN_MAX - 1)) — pick a shorter state directory"
+
 # The state directory is the whole isolation. Two instances sharing one is
 # CLAUDE.md's "a key not resolving under *these* roots" row: the second
 # instance's roots differ, so the first instance's projects read as gone and

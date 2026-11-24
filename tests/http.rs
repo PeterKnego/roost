@@ -17,7 +17,7 @@ fn the_service_worker_is_served_from_the_root_scope() {
 fn index_lists_projects() {
     let (_d, port) = fixture();
     let body = ureq::get(&format!("http://127.0.0.1:{port}/"))
-        .call().unwrap().into_string().unwrap();
+        .call().unwrap().into_body().read_to_string().unwrap();
     assert!(body.contains("proj"));
 }
 
@@ -25,7 +25,7 @@ fn index_lists_projects() {
 fn workspace_page_applies_project_settings() {
     let (_d, port) = fixture();
     let body = ureq::get(&format!("http://127.0.0.1:{port}/proj"))
-        .call().unwrap().into_string().unwrap();
+        .call().unwrap().into_body().read_to_string().unwrap();
     assert!(body.contains("/static/themes/light.css")); // .roost config read per request
     assert!(body.contains("data-project=\"proj\""));
 }
@@ -34,17 +34,17 @@ fn workspace_page_applies_project_settings() {
 fn fragments_render_and_errors_become_hints() {
     let (_d, port) = fixture();
     let base = format!("http://127.0.0.1:{port}");
-    let tree = ureq::get(&format!("{base}/frag/proj/tree")).call().unwrap().into_string().unwrap();
+    let tree = ureq::get(&format!("{base}/frag/proj/tree")).call().unwrap().into_body().read_to_string().unwrap();
     assert!(tree.contains("hello.md"));
     let file = ureq::get(&format!("{base}/frag/proj/file?path=hello.md"))
-        .call().unwrap().into_string().unwrap();
+        .call().unwrap().into_body().read_to_string().unwrap();
     // The id is part of a heading's normal output now (render::fill_heading_ids),
     // so this asserts the whole tag rather than being loosened to a
     // `contains("Hello")` that could not tell a heading from a paragraph.
     assert!(file.contains("<h1 id=\"hello\">Hello</h1>"), "{file}");
     // escape attempt: 200 + hint, and definitely no file content
     let esc = ureq::get(&format!("{base}/frag/proj/file?path=../../../etc/passwd"))
-        .call().unwrap().into_string().unwrap();
+        .call().unwrap().into_body().read_to_string().unwrap();
     assert!(esc.contains("class=\"hint\""));
     assert!(!esc.contains("root:"));
 }
@@ -53,7 +53,7 @@ fn fragments_render_and_errors_become_hints() {
 fn multi_segment_workspace_url_resolves_the_nested_directory() {
     let (_d, port) = nested_fixture();
     let body = ureq::get(&format!("http://127.0.0.1:{port}/karpie/sub"))
-        .call().unwrap().into_string().unwrap();
+        .call().unwrap().into_body().read_to_string().unwrap();
     assert!(body.contains("data-project=\"karpie/sub\""));
 }
 
@@ -61,7 +61,7 @@ fn multi_segment_workspace_url_resolves_the_nested_directory() {
 fn frag_route_resolves_a_nested_projects_fragment_kind() {
     let (_d, port) = nested_fixture();
     let tree = ureq::get(&format!("http://127.0.0.1:{port}/frag/karpie/sub/tree"))
-        .call().unwrap().into_string().unwrap();
+        .call().unwrap().into_body().read_to_string().unwrap();
     assert!(tree.contains("inner.rs"));
 }
 
@@ -79,7 +79,7 @@ fn frag_projects_route_serves_the_cross_project_strip() {
         .call()
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let body = resp.into_string().unwrap();
+    let body = resp.into_body().read_to_string().unwrap();
     assert!(body.contains("class=\"projstrip\""));
 }
 
@@ -101,7 +101,7 @@ fn nested_project_websockets_connect() {
     let _ = ws.close(None);
 
     let mut term = ws_connect_term(port, "/ws/karpie/sub/term/shell").unwrap();
-    term.send(tungstenite::Message::Binary(b"hi\r".to_vec())).unwrap();
+    term.send(tungstenite::Message::Binary(b"hi\r".to_vec().into())).unwrap();
     let mut seen = String::new();
     for _ in 0..60 {
         match term.read() {
@@ -132,7 +132,7 @@ fn static_assets_served_with_type() {
     let (_d, port) = fixture();
     let resp = ureq::get(&format!("http://127.0.0.1:{port}/static/vendor/highlight.min.js"))
         .call().unwrap();
-    assert!(resp.content_type().starts_with("text/javascript"));
+    assert!(resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").starts_with("text/javascript"));
 }
 
 #[cfg(unix)]
@@ -152,14 +152,9 @@ fn theme_css_symlink_escaping_the_project_is_refused() {
     std::os::unix::fs::symlink(&secret, d.path().join("themeleak/.roost/theme.css")).unwrap();
     let port = start(vec![d.path().to_path_buf()]);
 
-    match ureq::get(&format!("http://127.0.0.1:{port}/frag/themeleak/theme.css")).call() {
-        Err(ureq::Error::Status(code, r)) => {
-            assert_eq!(code, 404);
-            assert!(!r.into_string().unwrap().contains("top secret"));
-        }
-        Ok(r) => panic!("symlink escape must not be served; got {:?}", r.into_string()),
-        Err(e) => panic!("unexpected error: {e:?}"),
-    }
+    let (code, _, body) = common::get_full(port, "/frag/themeleak/theme.css");
+    assert_eq!(code, 404, "symlink escape must not be served; got {body:?}");
+    assert!(!body.contains("top secret"));
 }
 
 /// The `serve_theme` unit-test helper in routes.rs calls `serve_project_theme`
@@ -181,18 +176,13 @@ fn frag_theme_directory_serves_presentation_and_refuses_code_over_http() {
         .call()
         .unwrap();
     assert_eq!(css.status(), 200);
-    assert_eq!(css.header("Content-Security-Policy"), Some("sandbox"));
-    let body = css.into_string().unwrap();
+    assert_eq!(css.headers().get("Content-Security-Policy").and_then(|v| v.to_str().ok()), Some("sandbox"));
+    let body = css.into_body().read_to_string().unwrap();
     assert!(body.contains("body{color:red}"));
 
-    match ureq::get(&format!("http://127.0.0.1:{port}/frag/themedir/theme/app.js")).call() {
-        Err(ureq::Error::Status(code, r)) => {
-            assert_eq!(code, 404);
-            assert!(!r.into_string().unwrap().contains("pwned"));
-        }
-        Ok(r) => panic!("a project may never serve code; got {:?}", r.into_string()),
-        Err(e) => panic!("unexpected error: {e:?}"),
-    }
+    let (code, _, body) = common::get_full(port, "/frag/themedir/theme/app.js");
+    assert_eq!(code, 404, "a project may never serve code; got {body:?}");
+    assert!(!body.contains("pwned"));
 }
 
 /// A first version of the theme-directory router dispatch keyed off "does
@@ -218,7 +208,7 @@ fn nested_project_named_theme_still_serves_ordinary_fragments_over_http() {
     let body = ureq::get(&format!("http://127.0.0.1:{port}/frag/a/theme/tree"))
         .call()
         .unwrap()
-        .into_string()
+        .into_body().read_to_string()
         .unwrap();
     assert!(body.contains("inner.rs"), "project a/theme's own tree, not a 404: {body}");
 }
@@ -227,7 +217,7 @@ fn nested_project_named_theme_still_serves_ordinary_fragments_over_http() {
 fn diff_traversal_path_is_rejected_with_hint() {
     let (_d, port) = fixture();
     let body = ureq::get(&format!("http://127.0.0.1:{port}/frag/proj/diff?path=../../../etc/passwd"))
-        .call().unwrap().into_string().unwrap();
+        .call().unwrap().into_body().read_to_string().unwrap();
     assert!(body.contains("class=\"hint\""));
     assert!(!body.contains("root:"));
 }
@@ -243,7 +233,7 @@ fn tree_dir_traversal_is_rejected_with_hint_and_leaks_no_listing() {
     // ".." from the project dir resolves to the tempdir root, which holds
     // `secret.txt` alongside `proj` — a real, canonicalizable escape.
     let body = ureq::get(&format!("{base}/frag/proj/tree?dir=.."))
-        .call().unwrap().into_string().unwrap();
+        .call().unwrap().into_body().read_to_string().unwrap();
     assert!(body.contains("class=\"hint\""));
     assert!(!body.contains("secret.txt"));
     assert!(!body.contains("<li"));
@@ -256,11 +246,11 @@ fn tree_dir_lazily_returns_a_subdirectorys_children() {
     std::fs::write(d.path().join("proj/sub/inner.txt"), "").unwrap();
     let base = format!("http://127.0.0.1:{port}");
     // the root render shows `sub` closed, without its child inlined
-    let root = ureq::get(&format!("{base}/frag/proj/tree")).call().unwrap().into_string().unwrap();
+    let root = ureq::get(&format!("{base}/frag/proj/tree")).call().unwrap().into_body().read_to_string().unwrap();
     assert!(root.contains("data-rel=\"sub\""));
     assert!(!root.contains("inner.txt"));
     // the lazy fetch for that same directory returns exactly its children
-    let sub = ureq::get(&format!("{base}/frag/proj/tree?dir=sub")).call().unwrap().into_string().unwrap();
+    let sub = ureq::get(&format!("{base}/frag/proj/tree?dir=sub")).call().unwrap().into_body().read_to_string().unwrap();
     assert!(sub.contains("inner.txt"));
 }
 
@@ -276,7 +266,7 @@ fn tree_dir_with_empty_rel_returns_the_root_listing() {
     let (d, port) = fixture();
     std::fs::create_dir(d.path().join("proj/sub")).unwrap();
     let base = format!("http://127.0.0.1:{port}");
-    let root_dir = ureq::get(&format!("{base}/frag/proj/tree?dir=")).call().unwrap().into_string().unwrap();
+    let root_dir = ureq::get(&format!("{base}/frag/proj/tree?dir=")).call().unwrap().into_body().read_to_string().unwrap();
     assert!(!root_dir.contains("class=\"hint\""));
     assert!(root_dir.contains("data-rel=\"hello.md\""));
     assert!(root_dir.contains("data-rel=\"sub\""));
@@ -331,7 +321,7 @@ line three
     let body = ureq::get(&format!("http://127.0.0.1:{port}/frag/proposal-frag/proposal?id=frag-1"))
         .call()
         .unwrap()
-        .into_string()
+        .into_body().read_to_string()
         .unwrap();
     assert!(body.contains("hello.md"), "must name the file: {body}");
     assert!(body.contains("-line two") && body.contains("+CHANGED"), "must show the changed hunk: {body}");
@@ -341,7 +331,7 @@ line three
     let gone = ureq::get(&format!("http://127.0.0.1:{port}/frag/proposal-frag/proposal?id=no-such-id"))
         .call()
         .unwrap()
-        .into_string()
+        .into_body().read_to_string()
         .unwrap();
     assert!(gone.contains("no longer open"), "got {gone}");
 

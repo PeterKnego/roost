@@ -27,9 +27,9 @@
 # here. Measured cost, 2026-09-10, `trivy --severity HIGH,CRITICAL`: Debian
 # trixie-slim carries 53 more findings than alpine:3.22 and **every one of them
 # is unfixable** — while the count a CI gate acts on is identical, two each.
-ARG RUNTIME_IMAGE=debian@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
-# rust 1.98.1
-ARG BUILDER_IMAGE=rust@sha256:bce1476d4be4d78b83705bc5f428b86d640eeeea33e9dadafbc037b5703a53bf
+ARG RUNTIME_IMAGE=debian@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+# rust 1.100.0-slim-trixie
+ARG BUILDER_IMAGE=rust@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a
 
 # Files roost writes into a mounted checkout must be owned by whoever owns that
 # checkout on the host, or every file the agent touches comes back unwritable.
@@ -48,13 +48,31 @@ ARG BUILD_DATE=unknown
 # --------------------------------------------------------------------------
 # Builder: a static musl binary, cross-compiled rather than emulated
 # --------------------------------------------------------------------------
-# On $BUILDPLATFORM on purpose. The binary has no C dependencies and
-# `.cargo/config.toml` already sets `linker = "rust-lld"` for
-# aarch64-unknown-linux-musl — added for exactly this cross-link, with a comment
-# saying it needs no cross-gcc, `cross` or `zig`. Emulating an arm64 Rust build
-# under QEMU costs tens of minutes for the same bytes.
+# On $BUILDPLATFORM on purpose. `.cargo/config.toml` already sets
+# `linker = "rust-lld"` for aarch64-unknown-linux-musl — added for exactly this
+# cross-link, with a comment saying it needs no cross-gcc, `cross` or `zig`.
+# Emulating an arm64 Rust build under QEMU costs tens of minutes for the same
+# bytes.
+#
+# The binary *does* compile C now: `ring`, through `ureq`, since the version
+# check (#85). Before that this stage said "no C dependencies" and installed no
+# C compiler, and the image stopped building — cc-rs looks for
+# `x86_64-linux-musl-gcc` and finds nothing. clang rather than musl-tools,
+# because one clang targets both triples (cc-rs passes it `--target`), which
+# keeps the arm64 build a cross-compile with no cross-gcc, the property this
+# stage runs on $BUILDPLATFORM for. It is the same pair the release preflight
+# uses on hosts without musl-tools.
 FROM --platform=$BUILDPLATFORM ${BUILDER_IMAGE} AS builder
 ARG TARGETARCH
+
+RUN set -eux; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang llvm; \
+    rm -rf /var/lib/apt/lists/*
+ENV CC_x86_64_unknown_linux_musl=clang \
+    AR_x86_64_unknown_linux_musl=llvm-ar \
+    CC_aarch64_unknown_linux_musl=clang \
+    AR_aarch64_unknown_linux_musl=llvm-ar
 
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
@@ -190,6 +208,9 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -fsS http://127.0.0.1:8123/static/favicon-32.png -o /dev/null || exit 1
 
 # tini as PID 1: dtach masters reparent to it by design, so without an init they
-# accumulate as zombies in a long-lived container.
+# accumulate as zombies in a long-lived container. It has to *be* PID 1: run
+# with compose's `init: true` or `docker run --init`, Docker's own init takes
+# PID 1, tini becomes its child, and it warns on every start that it reaps
+# nothing (#199). The compose file leaves `init` unset for that reason.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/roost"]
 CMD ["8123"]
