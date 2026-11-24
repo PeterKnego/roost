@@ -568,11 +568,15 @@ A version with a `-` in it is a prerelease: it builds all four targets and the
 packages, and publishes to neither the tap nor crates.io. Use one to exercise
 a change to the release itself.
 
-**Merge `master` back into `develop` whenever `master` has a commit `develop`
-lacks.** On the route above it has none, and
-`git merge-base --is-ancestor origin/master origin/develop` succeeding says so.
-It does have one after a bump made on `master` (by `release.sh` itself, or a
-bump PR into `master`) or a hotfix merged there. Then open a PR merging
+**Merge `master` back into `develop` whenever `master` has a change `develop`
+lacks.** Check the trees, not the history: `git diff --quiet origin/develop
+origin/master` succeeding means there is nothing to merge back. Every promote
+leaves its own merge commit on `master` alone, so an ancestry check such as
+`git merge-base --is-ancestor origin/master origin/develop` fails after every
+release, even when the two trees are identical. That merge commit is harmless:
+the next promote merges cleanly over it. On the route above the trees match.
+They differ after a bump made on `master` (by `release.sh` itself, or a bump
+PR into `master`) or a hotfix merged there. Then open a PR merging
 `master` into `develop` and merge it with a merge commit, never squash —
 squashing would put master's content on `develop` under a new SHA and make the
 next release merge conflict. A skipped merge-back does not fail loudly at the
