@@ -449,7 +449,7 @@ const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${locat
 // server-side too (SetMode refuses it, OpenTab coerces a raw Edit request to
 // Preview, and EditBuffer — the actual save chokepoint — refuses to create a
 // buffer at all), so no client bug here can make a save truncate a file.
-const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf"];
+const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "mp4", "m4v", "mov", "webm"];
 // Must extract the extension exactly as assets::ext_of does, or syncing the
 // lists would not sync the behaviour: take the LAST path segment (so
 // `img.d/README` has no extension rather than inheriting `d`) and require a
@@ -461,15 +461,17 @@ const extOf = (rel) => {
 };
 const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 /// Files this app can *draw* rather than only spell out: markdown renders, and
-/// so does every image, and a PDF through the browser's own viewer (#121).
-/// Mirrors routes.rs's IMAGE_EXT and PDF_EXT plus the two markdown extensions
+/// so does every image, a PDF through the browser's own viewer (#121), and a
+/// video through its player. Mirrors routes.rs's IMAGE_EXT, PDF_EXT and
+/// VIDEO_EXT plus the two markdown extensions
 /// render.rs's file_fragment branches on.
 ///
 /// Deliberately wider than NO_TEXT_EDIT_EXT, and the gap is the point — svg is
 /// here *and* editable, because it draws as a picture and is text. CLAUDE.md
 /// records the release where gating Edit on "is it an image" silently took
 /// that away.
-const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf"];
+const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf",
+  "mp4", "m4v", "mov", "webm"];
 const hasRenderedForm = (rel) => RENDERED_EXT.includes(extOf(rel));
 /// How a file opens when the user just clicks it.
 ///
