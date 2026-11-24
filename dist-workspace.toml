@@ -113,6 +113,17 @@ github-custom-job-permissions = { "publish-crates-io" = { "id-token" = "write", 
 # Listed for the record; release.yml is hand-edited (allow-dirty), so the job block there is what runs.
 global-artifacts-jobs = ["./build-linux-packages", "./sign-release-artifacts", "./package-extension"]
 
+# dist 0.32 builds aarch64-apple-darwin on `macos-14` unless told otherwise, and
+# GitHub retired that image on 2026-11-02: a job asking for it is refused before
+# it starts ("The configuration 'macos-14-arm64-us-default' is not supported").
+# Pull-request runs skip the artifact builds, so the first thing to ask for it
+# was the v0.9.0 tag, which then could never publish. The plan is computed at
+# run time, so this key reaches the workflow despite `allow-dirty` above;
+# `dist plan --output-format=json` shows each target's runner. x86_64 already
+# defaults to `macos-15-intel`.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # dtach is a *runtime* prerequisite, not a build one — roost spawns it, it is
 # not linked against. `stage = ["run"]` is what turns this into a `depends_on`
 # in the formula rather than a `brew install` on the build runner. This is the

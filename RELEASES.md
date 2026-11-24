@@ -10,7 +10,11 @@ added later never reaches the release page.
 Keep the newest section at the top, and say what a change means for someone
 running roost rather than what the diff did.
 
-## v0.9.0 — 2026-11-24 — chat with your Claude from a phone
+## v0.9.1 — 2026-11-24 — chat with your Claude from a phone
+
+v0.9.0 was tagged but never released. GitHub had retired the macOS runner its
+Apple Silicon build asked for, so nothing was published. 0.9.1 is the same
+release built on `macos-15`, and everything below is new since v0.8.0.
 
 The headline is a phone-first chat view over a Claude that is already running
 in a roost terminal. Around it, the browser bridge comes to Firefox, a renamed
@@ -31,8 +35,8 @@ video.
   browser's own player, with seeking, on phones too, instead of "binary file".
 - **roost bridge for Firefox (#189).** The same tools, consent window and
   handoff page as in Chrome. The release carries
-  `roost-extension-0.9.0-firefox.zip` (Firefox 140 or later), and
-  `roost-extension-0.9.0-webstore.zip`, laid out the way the Chrome Web Store
+  `roost-extension-0.9.1-firefox.zip` (Firefox 140 or later), and
+  `roost-extension-0.9.1-webstore.zip`, laid out the way the Chrome Web Store
   wants it (#175).
 - **Renaming a worktree no longer kills its terminals (#179, #180, #187,
   #194).** Moving a project or worktree directory (`git worktree move`, `mv`)
