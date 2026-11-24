@@ -27,9 +27,9 @@
 # here. Measured cost, 2026-09-10, `trivy --severity HIGH,CRITICAL`: Debian
 # trixie-slim carries 53 more findings than alpine:3.22 and **every one of them
 # is unfixable** — while the count a CI gate acts on is identical, two each.
-ARG RUNTIME_IMAGE=debian@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
-# rust 1.98.1
-ARG BUILDER_IMAGE=rust@sha256:bce1476d4be4d78b83705bc5f428b86d640eeeea33e9dadafbc037b5703a53bf
+ARG RUNTIME_IMAGE=debian@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
+# rust 1.100.0-slim-trixie
+ARG BUILDER_IMAGE=rust@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a
 
 # Files roost writes into a mounted checkout must be owned by whoever owns that
 # checkout on the host, or every file the agent touches comes back unwritable.

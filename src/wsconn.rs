@@ -136,7 +136,7 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
     // any page the user visits can drive this socket, and this socket can
     // write files. See spec §Security and src/term.rs's identical check.
     let allowed = crate::config::allowed_origins();
-    let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
+    let config = WebSocketConfig::default().max_message_size(Some(MAX_FRAME_BYTES));
     // Open through the handshake — the 101 and any refusal go out on this
     // object — and closed below, the moment a second writer exists.
     let gate = Gate::open();

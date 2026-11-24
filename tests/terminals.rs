@@ -272,7 +272,7 @@ fn a_claude_terminal_has_claude_typed_into_it_once_its_shell_exists() {
     a.send(tungstenite::Message::Text(r#"{"t":"NewTerminal","pane":3}"#.into())).unwrap();
     read_until(&mut a, r#""session":"term1""#);
     let mut p = ws_connect_term(port, "/ws/claudeterm/term/term1").unwrap();
-    p.send(tungstenite::Message::Binary(b"marker\r".to_vec())).unwrap();
+    p.send(tungstenite::Message::Binary(b"marker\r".to_vec().into())).unwrap();
     let mut plain = String::new();
     for _ in 0..100 {
         match p.read() {

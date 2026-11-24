@@ -31,11 +31,11 @@ include = [
 ]
 
 [dependencies]
-tungstenite = "0.24"
-portable-pty = "0.8"
+tungstenite = "0.30"
+portable-pty = "0.9"
 pulldown-cmark = "0.13"
-toml = "0.8"
-toml_edit = "0.22"
+toml = "1"
+toml_edit = "0.25"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 notify = "8.2"
@@ -44,18 +44,18 @@ futures-executor = "0.3"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false }
 # Promoted from a dev-dependency: the version check is the one thing roost does
-# that reaches the network. `proxy-from-env` is off in ureq's default feature
-# set, so a default build ignores HTTPS_PROXY entirely — and an office behind
+# that reaches the network. It must honour HTTPS_PROXY, because an office behind
 # one NAT, where a proxy is mandatory, is exactly where this check was designed
-# to work. The TLS backend is left alone: the default `tls` feature is
-# webpki-roots (the bundled Mozilla set), and `native-tls` would drag OpenSSL
-# into a static musl build.
-ureq = { version = "2.12", features = ["proxy-from-env"] }
+# to work. ureq 3 reads the proxy from the environment by default (ureq 2 needed
+# its `proxy-from-env` feature for that). The TLS backend is left alone: the
+# default `rustls` feature is ring plus webpki-roots (the bundled Mozilla set),
+# and `native-tls` would drag OpenSSL into a static musl build.
+ureq = "3.5"
 # Step 4 of #65: verify a release tarball's minisign signature offline, then
 # open it. All three are pure Rust — the musl targets need no C toolchain for
 # them (ring, which ureq brings, is the one that does, and dist installs
 # musl-tools on the release runners for it).
-minisign-verify = "0.2"
+minisign-verify = "0.3"
 lzma-rs = "0.3"
 tar = "0.4"
 # Already in Cargo.lock as a transitive dependency of portable-pty, tar,
@@ -75,12 +75,16 @@ crc32fast = "1"
 # `browser.rs` signs every call it relays to the browser extension with
 # HMAC-SHA256, and a hand-rolled HMAC is not a thing to own.
 ring = "0.17"
+# The chat view (`chat.rs`) needs the *rendered* screen of a Claude terminal —
+# which menu is up and which option is selected — and `screen.rs` keeps a byte
+# log, not a grid. Pure Rust, no C, so the musl builds are unaffected.
+vt100 = "0.18"
 
 [dev-dependencies]
 tempfile = "3"
 # Generates a keypair and signs inside the tests, so no secret key is ever
 # committed. Same author and format as the C minisign the release uses.
-minisign = "0.9"
+minisign = "0.10"
 
 [profile.release]
 strip = true

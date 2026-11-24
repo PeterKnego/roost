@@ -420,6 +420,11 @@ const PANE_ICONS = {
   // as the header's own close button (`SVG_X` in render.rs).
   close: '<svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>',
   prloop: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2.6 6.4a5.6 5.6 0 0 1 9.3-2.2l1.5 1.4"/><path d="M13.4 9.6a5.6 5.6 0 0 1-9.3 2.2L2.6 10.4"/><path d="M13.6 2.4v3.2h-3.2M2.4 13.6v-3.2h3.2"/></svg>',
+  // A tray with an arrow leaving it: the tree's upload button (see
+  // buildPaneIcons).
+  upload: '<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10.5V2.5M5 5.5l3-3 3 3M2.5 10v3.5h11V10"/></svg>',
+  // A speech bubble: the chat view of this Claude terminal (static/chat.js).
+  chat: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"><path d="M2.5 3.5h11v7.5H7l-3 2.5V11H2.5z"/></svg>',
   newterm: '<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"><rect x="1.5" y="3.5" width="10.5" height="9.5" rx="1.2"/><path d="M4 6.8l1.7 1.5L4 9.8M8 10.6h2.6"/><path d="M13.3 2.2v3.6M11.5 4h3.6"/></svg>',
 };
 // The official Claude mark (lobehub packaging of Anthropic's starburst,
@@ -1357,8 +1362,10 @@ function render() {
   // is the right contribution there — nothing is taking up that space.
   const mbar = document.getElementById("mobilebar");
   if (mbar) document.documentElement.style.setProperty("--mobilebar-h", mbar.offsetHeight + "px");
-  const tkeys = document.getElementById("termkeys");
-  if (tkeys) document.documentElement.style.setProperty("--termkeys-h", tkeys.offsetHeight + "px");
+  // Before the measurement below, which reads the bar's height: a State
+  // broadcast can put a terminal in front (or take it away) without a pane
+  // switch, e.g. ✻ pressed in the pane that is showing a file.
+  syncTermKeys();
   // htmx swaps into #gitinfo/#wtlabel and the #projcount/#bellcount writes
   // below all change the header's width while the panel is open, and
   // #searchbox uses margin:auto, so the field (and the panel anchored to it)
@@ -1639,6 +1646,25 @@ function buildPaneIcons(host, pi, pane, active, content) {
       });
       if (yes) newTerminal(pi, "prloop");
     }, "newprloop");
+  }
+  // The chat view, offered on a terminal roost knows is running Claude —
+  // anywhere else it would open onto "no Claude here".
+  if (active && active.k === "Terminal" && (state.claude_sessions || []).includes(active.session)
+      && typeof openChat === "function") {
+    icon(PANE_ICONS.chat, "chat with this Claude", () => openChat(active.session, active.home), "openchat");
+  }
+  // #110 put "Upload files…" in the tree's context menu, but that menu is
+  // reached by `contextmenu`, which iOS Safari never fires for a
+  // long-press — so on an iPhone upload was still unreachable. A button
+  // needs no gesture a phone lacks. Uploads to the project root; the menu
+  // (long-press on a phone) is still the way to aim at a folder.
+  //
+  // On any pane that *holds* the tree, not only while the tree is its active
+  // tab: on a phone, a Claude opened from the Files view lands in that same
+  // pane, and with the terminal in front the button vanished from the one
+  // view a phone user goes to for files.
+  if (pane.tabs.some((t) => t.k === "Tree")) {
+    icon(PANE_ICONS.upload, "upload files to the project root", () => pickAndUpload(""), "upload");
   }
   if (active && active.k === "Tree") {
     const hidden = showHidden();
@@ -2524,6 +2550,84 @@ function pickedInTreeOrder() {
   return seen;
 }
 
+// --- long-press = right-click, on a touch screen -------------------------
+//
+// The tree's and the Changes list's menus are reached by `contextmenu`, and
+// iOS Safari never fires one for a long-press. So a held finger on either
+// sends the same event a right-click does, at the finger — every existing
+// handler (a file, a folder, blank space, a change row) answers it unchanged,
+// and there is no second menu implementation to drift.
+//
+// Two things a long-press must not also do. Android *does* fire its own
+// `contextmenu` for the same press, so whichever of the two comes first wins
+// and the other is swallowed. And lifting the finger still clicks, which
+// would open the file or fold the folder under the menu; that one click is
+// swallowed too. Limited to those two panes: in an editor or a terminal a
+// long-press selects text, and that must keep working.
+const LONG_PRESS_MS = 500;
+const LONG_PRESS_SLOP_PX = 10;
+const longPress = { timer: 0, x: 0, y: 0, target: null, fired: false, swallowClickUntil: 0 };
+
+function longPressArea(t) {
+  return t && t.closest && t.closest('.content[data-kind="Tree"], .content[data-kind="Changes"]');
+}
+
+function cancelLongPress() {
+  clearTimeout(longPress.timer);
+  longPress.timer = 0;
+  longPress.target = null;
+}
+
+document.addEventListener("pointerdown", (e) => {
+  cancelLongPress();
+  longPress.fired = false;
+  if (e.pointerType !== "touch" || !longPressArea(e.target)) return;
+  longPress.x = e.clientX;
+  longPress.y = e.clientY;
+  longPress.target = e.target;
+  longPress.timer = setTimeout(() => {
+    const target = longPress.target;
+    longPress.timer = 0;
+    if (!target || !target.isConnected || longPress.fired) return;
+    longPress.fired = true;
+    longPress.swallowClickUntil = Date.now() + 1500;
+    target.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true, cancelable: true, clientX: longPress.x, clientY: longPress.y,
+    }));
+  }, LONG_PRESS_MS);
+}, true);
+
+document.addEventListener("pointermove", (e) => {
+  if (!longPress.timer) return;
+  if (Math.hypot(e.clientX - longPress.x, e.clientY - longPress.y) > LONG_PRESS_SLOP_PX) cancelLongPress();
+}, true);
+document.addEventListener("pointerup", () => { if (longPress.timer) cancelLongPress(); }, true);
+document.addEventListener("pointercancel", cancelLongPress, true);
+
+document.addEventListener("contextmenu", (e) => {
+  // Only the browser's own event for a press this code is tracking.
+  if (!e.isTrusted || !longPressArea(e.target)) return;
+  if (longPress.fired) {
+    e.preventDefault();
+    e.stopPropagation();
+    return;
+  }
+  if (longPress.timer) {
+    // Android got there first: let its event through, and stand down.
+    longPress.fired = true;
+    longPress.swallowClickUntil = Date.now() + 1500;
+    cancelLongPress();
+  }
+}, true);
+
+document.addEventListener("click", (e) => {
+  if (!longPress.fired || Date.now() > longPress.swallowClickUntil) return;
+  longPress.fired = false;
+  if (!longPressArea(e.target)) return;
+  e.preventDefault();
+  e.stopPropagation();
+}, true);
+
 function wireFragment(content) {
   // Changes and Diff show changes, not places: New file, Rename and Delete
   // mean nothing there, and Delete on a change row read as "drop this
@@ -2581,11 +2685,13 @@ async function fileMenu(e, rel, isDir = false) {
   if (rel && !isDir) {
     const dirty = state && state.buffers && state.buffers.some((b) => b.rel === rel && b.dirty);
     items.push({ id: "download", label: dirty ? "Download (saved version)" : "Download" });
-    // #146. Offered when there is a Claude to send to or one can be started;
-    // otherwise it would be an item that can only ever fail.
-    if (LAUNCHES.includes("claude") || (state && (state.claude_sessions || []).length)) {
-      items.push({ id: "claude", label: "Send to Claude" });
-    }
+  }
+  // #146. Offered when there is a Claude to send to or one can be started;
+  // otherwise it would be an item that can only ever fail. A folder too:
+  // Claude Code takes `@dir/` as readily as a file, and the item used to be
+  // missing from a folder's menu altogether.
+  if (rel && (LAUNCHES.includes("claude") || (state && (state.claude_sessions || []).length))) {
+    items.push({ id: "claude", label: "Send to Claude" });
   }
   // #162. A folder — or blank tree space, which is the project root — zips.
   if (isDir || !rel) items.push({ id: "zip", label: "Download as zip" });
@@ -2611,7 +2717,7 @@ async function fileMenu(e, rel, isDir = false) {
   } else if (choice === "zip") {
     downloadZip(rel);
   } else if (choice === "claude") {
-    sendToClaude(rel);
+    sendToClaude(isDir ? `${rel}/` : rel);
   } else if (choice === "upload") {
     pickAndUpload(dir);
   } else if (choice === "rename") {
@@ -4679,9 +4785,34 @@ function showMobilePane(pi) {
   // alone, because switching panes does not go through a State broadcast —
   // without this the grid keeps the previous pane's arithmetic and the
   // terminal is fitted to a frame the wrong size by exactly the bar.
+  syncTermKeys();
+  fitTerminals();
+}
+
+/// Whether the pane the switcher has in front is showing a terminal.
+///
+/// Asked of the layout, not of the pane's number. The key bar used to be
+/// `body[data-mpane="3"]`, on the assumption that terminals live in the right
+/// pane — but every pane header has + and ✻, so a Claude started from the
+/// pane that was showing a file opened there, in pane 2, and came up with no
+/// arrows, Esc or Enter: unusable on a phone, which is what the bar is for.
+function frontIsTerminal() {
+  if (!state) return false;
+  const pane = state.panes[Number(document.body.dataset.mpane)];
+  const t = pane && pane.tabs[pane.active];
+  return !!(t && t.k === "Terminal");
+}
+
+/// Shows the key bar exactly when a terminal is in front, and re-measures the
+/// height #grid subtracts for it. Re-fits only when that height changed, since
+/// `render()` calls this on every State broadcast.
+function syncTermKeys() {
+  const on = frontIsTerminal();
+  const changed = document.body.classList.contains("termfront") !== on;
+  document.body.classList.toggle("termfront", on);
   const tk = document.getElementById("termkeys");
   if (tk) document.documentElement.style.setProperty("--termkeys-h", tk.offsetHeight + "px");
-  fitTerminals();
+  if (changed) fitTerminals();
 }
 
 /// The gesture route: a tap that means "show me this" has to also bring the
@@ -4727,9 +4858,11 @@ function appCursor(t) {
 }
 
 /// The terminal a key press should go to: the one showing in the pane the
-/// switcher has in front, falling back to the last focused session.
+/// switcher has in front, falling back to the last focused session. The front
+/// pane, not pane 3 — see `frontIsTerminal`.
 function targetTerm() {
-  const host = document.querySelector('.pane[data-pane="3"] .termhost[data-session]');
+  const n = String(Number(document.body.dataset.mpane));
+  const host = document.querySelector(`.pane[data-pane="${n}"] .termhost[data-session]`);
   const byPane = host && terms.get(host.dataset.session);
   return byPane || terms.get(lastFocusedSession) || null;
 }

@@ -31,7 +31,7 @@ pub fn handle_ws(stream: TcpStream, roots: &[PathBuf]) {
     // WebSocket handshakes bypass the same-origin policy: without this check any
     // page the user visits can open this socket and get a shell. See spec §Security.
     let allowed = crate::config::allowed_origins();
-    let config = WebSocketConfig { max_message_size: Some(MAX_FRAME_BYTES), ..Default::default() };
+    let config = WebSocketConfig::default().max_message_size(Some(MAX_FRAME_BYTES));
     // Open through the handshake and through every refusal below — each of
     // those closes this object itself, before any writer thread exists — and
     // closed at the one point a second writer appears.

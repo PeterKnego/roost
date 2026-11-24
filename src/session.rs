@@ -215,6 +215,16 @@ struct Session {
     screens: crate::screen::Screens,
     subs: HashMap<u64, SyncSender<Vec<u8>>>,
     sizes: HashMap<u64, (u16, u16)>,
+    /// The session's screen as a grid, at the PTY's own size, for the chat
+    /// view (`chat.rs`): which menu Claude has up and which option is
+    /// selected is a property of the rendered screen, which `screens` (a byte
+    /// log) cannot answer. Fed under the lock alongside `screens` — pure CPU,
+    /// no I/O — and resized wherever the PTY is. No scrollback: only what is
+    /// on screen now is ever asked.
+    ///
+    /// Starts blank on a rejoin after a restart; the next repaint fills it,
+    /// and a chat that sees a blank screen offers nothing rather than guessing.
+    vt: vt100::Parser,
     next_id: u64,
     /// Set on the spawn that consumed a parked launch; `None` for a plain
     /// shell. Survives the typing of the keystrokes on purpose.
@@ -838,6 +848,7 @@ fn attach_as(project: &str, name: &str, dir: &Path, renamed_to: Option<&str>) ->
                 },
                 subs: HashMap::new(),
                 sizes: HashMap::new(),
+                vt: new_vt(24, 80),
                 next_id: 0,
                 launched: launch.clone(),
             },
@@ -883,6 +894,7 @@ fn attach_as(project: &str, name: &str, dir: &Path, renamed_to: Option<&str>) ->
                             // raw read: it is the same bytes except for the
                             // one case it has to reconcile (see its doc).
                             let chunk = s.screens.ingest(&buf[..n], &switches);
+                            s.vt.process(&buf[..n]);
                             // try_send, not send: a subscriber whose queue is
                             // full (frozen tab, dead socket) is dropped rather
                             // than backing up the whole fan-out (I4).
@@ -964,6 +976,7 @@ pub fn resize(key: &str, id: u64, cols: u16, rows: u16) {
     s.sizes.insert(id, (cols, rows));
     if let Some((c, r)) = min_geometry(&s.sizes) {
         let _ = s.master.resize(PtySize { rows: r, cols: c, pixel_width: 0, pixel_height: 0 });
+        vt_resize(&mut s.vt, r, c);
     }
 }
 
@@ -977,7 +990,42 @@ pub fn detach(key: &str, id: u64) {
     s.sizes.remove(&id);
     if let Some((c, r)) = min_geometry(&s.sizes) {
         let _ = s.master.resize(PtySize { rows: r, cols: c, pixel_width: 0, pixel_height: 0 });
+        vt_resize(&mut s.vt, r, c);
     }
+}
+
+fn new_vt(rows: u16, cols: u16) -> vt100::Parser {
+    let nz = |n: u16| std::num::NonZeroU16::new(n.max(1)).unwrap_or(std::num::NonZeroU16::MIN);
+    vt100::Parser::new(nz(rows), nz(cols), 0)
+}
+
+fn vt_resize(vt: &mut vt100::Parser, rows: u16, cols: u16) {
+    let nz = |n: u16| std::num::NonZeroU16::new(n.max(1)).unwrap_or(std::num::NonZeroU16::MIN);
+    vt.set_size(nz(rows), nz(cols));
+}
+
+/// What the chat view reads of a session's screen. Text only, one string per
+/// row, plus the two modes that decide which bytes a key or a paste has to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScreenSnapshot {
+    pub rows: Vec<String>,
+    pub application_cursor: bool,
+    pub bracketed_paste: bool,
+}
+
+/// The rendered screen of a session this process is pumping, or `None` when
+/// it is not in the map (not attached here). Copied out under the lock; the
+/// caller does its parsing with the lock released.
+pub fn screen_snapshot(key: &str) -> Option<ScreenSnapshot> {
+    let guard = sessions().lock().unwrap_or_else(|e| e.into_inner());
+    let s = guard.map.get(key)?;
+    let sc = s.vt.screen();
+    let (_, cols) = sc.size();
+    Some(ScreenSnapshot {
+        rows: sc.rows(0, cols.get()).collect(),
+        application_cursor: sc.application_cursor(),
+        bracketed_paste: sc.bracketed_paste(),
+    })
 }
 
 /// The `SESSIONS` map key. Callers pass the *raw* slashed project form (e.g.

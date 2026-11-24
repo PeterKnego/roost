@@ -440,7 +440,7 @@ pub fn read_capped(r: impl std::io::Read, cap: u64) -> Result<Vec<u8>, String> {
 /// The real fetch: its own agent (see `download_agent`), redirects
 /// followed — `releases/download/` answers 302 to a CDN — and the cap checked
 /// against `Content-Length` before a byte of body is buffered. A non-2xx is
-/// an error in `ureq` 2 (`Error::Status`), whose message carries the code.
+/// an error in `ureq` 3 (`Error::StatusCode`), whose message carries the code.
 pub fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
     http_get_capped(url, MAX_ARCHIVE_BYTES)
 }
@@ -451,24 +451,29 @@ pub fn http_get_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// the check's ten seconds — a host that does not answer is no slower to
 /// give up on here — and the body gets `DOWNLOAD_SECS`.
 fn download_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(crate::version::TIMEOUT_SECS))
-        .timeout(std::time::Duration::from_secs(DOWNLOAD_SECS))
-        .user_agent(&crate::version::user_agent())
-        .try_proxy_from_env(true)
+    // Proxy from the environment is ureq 3's default; see `version::agent`.
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(crate::version::TIMEOUT_SECS)))
+        .timeout_global(Some(std::time::Duration::from_secs(DOWNLOAD_SECS)))
+        .user_agent(crate::version::user_agent())
         .build()
+        .into()
 }
 
 /// `http_get_bytes` with the cap as a parameter, so a test can reach both
 /// checks over a real socket without sending 64 MB.
 fn http_get_capped(url: &str, cap: u64) -> Result<Vec<u8>, String> {
     let resp = download_agent().get(url).call().map_err(|e| e.to_string())?;
-    if let Some(len) = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok()) {
+    if let Some(len) = resp.headers().get("Content-Length")
+        .and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok())
+    {
         if len > cap {
             return Err(format!("the server announced {len} bytes, above the {cap} byte cap"));
         }
     }
-    read_capped(resp.into_reader(), cap)
+    // `into_reader`, not `read_to_vec`: the latter has ureq's own 10 MB
+    // limit, below a release archive; `read_capped` is the bound here.
+    read_capped(resp.into_body().into_reader(), cap)
 }
 
 /// What the user said to the dialog. Two choices, two lifetimes: `Later`

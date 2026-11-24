@@ -154,7 +154,7 @@ try {
     if (ti >= 0) return JSON.stringify({ session: state.panes[pi].tabs[ti].session }); } return null; })()`));
   await evalIn(`send({ t: "StartTerminal", session: ${JSON.stringify(loc.session)} })`);
   await until(() => evalIn(`terms.has(${JSON.stringify(loc.session)})`), 30, "terminal");
-  await evalIn(`document.body.dataset.mpane = "3"; 0`);
+  await evalIn(`showMobilePane("3"); 0`);
   await evalIn(`window.__e = () => [...terms.values()][0];
     window.__mice = [];
     for (const t of ["mousedown", "mousemove", "mouseup"]) {

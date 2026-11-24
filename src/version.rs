@@ -303,10 +303,14 @@ pub type FetchFn = fn(&str) -> Result<String, String>;
 /// The configured agent. Three settings, each decided rather than defaulted;
 /// see the module's spec. Step 4's downloader reuses this.
 pub fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_secs(TIMEOUT_SECS))
-        .user_agent(&user_agent())
+    // ureq 3 reads HTTPS_PROXY/ALL_PROXY/NO_PROXY from the environment by
+    // default (`Proxy::try_from_env` in its `Config::default`), which is what
+    // ureq 2's `proxy-from-env` feature used to opt into.
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(TIMEOUT_SECS)))
+        .user_agent(user_agent())
         .build()
+        .into()
 }
 
 /// Every failure is one string: About says "could not check" and does not say
@@ -316,7 +320,8 @@ pub fn http_get(url: &str) -> Result<String, String> {
         .get(url)
         .call()
         .map_err(|e| e.to_string())?
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| e.to_string())
 }
 

@@ -85,7 +85,7 @@ fn notices_are_replayed_on_connect_and_read_state_mirrors() {
     // Read state is global: b marks read, a must be told.
     let mut b = ws_connect_path(port, "/ws/proj/_workspace").unwrap();
     read_until(&mut b, r#""t":"Notices""#);
-    b.send(tungstenite::Message::Text(format!(r#"{{"t":"MarkNoticeRead","id":{id}}}"#))).unwrap();
+    b.send(tungstenite::Message::Text(format!(r#"{{"t":"MarkNoticeRead","id":{id}}}"#).into())).unwrap();
     let after = read_until(&mut a, r#""read":true"#);
     assert!(after.contains(r#""t":"Notices""#), "a was not re-sent the list: {after}");
 }
