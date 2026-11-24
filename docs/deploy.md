@@ -524,15 +524,35 @@ page, and nothing fails at the time: the release publishes with dist's
 generated install instructions and no word about what changed. Preflight does
 not check this.
 
+**Bump the version on `develop`, in the same PR as that entry.** Change
+`Cargo.toml`'s `version` exactly as `release.sh` would (the first
+`version = "..."` line), run `cargo check` so `Cargo.lock` follows, and confirm
+with `cargo metadata --locked --format-version 1`. Then promote `develop` to
+`master` with a merge commit. That promote is the release's only PR into
+`master`, and so its only required approval: `master` needs one approval from
+someone other than the pusher on every PR, admins included. A bump made on
+`master` instead is a second PR and a second approval, and it leaves `develop`
+behind `master` by that commit.
+
+Then, on an up-to-date `master`:
+
 ```sh
 make release VERSION=0.5.2
 ```
 
+With the bump already merged, preflight accepts `HEAD` being `origin/master`
+itself. `release.sh` finds `Cargo.toml` already at the version with nothing to
+stage and `HEAD:Cargo.toml` agreeing, so it reports "already committed", tags
+the promote's merge commit, and pushes only the tag; its `git push origin
+master` is a no-op. The cost of this route is that `develop` names the new
+version from the bump until the tag exists. If that release then fails, the
+next attempt is a new version anyway, since a burnt tag is never re-pointed.
+
 Preflight refuses to tag when any of eleven known failures is present — the
 wrong branch, a dirty tree, drifted `dist` targets, a stale `Cargo.lock`, a
 version already on crates.io, a broken cross-link, failing tests, or a tap
-token the tap will not accept. It then bumps, tags, pushes, watches the release
-run, and reads every channel back.
+token the tap will not accept. It then bumps (a no-op on the route above),
+tags, pushes, watches the release run, and reads every channel back.
 
 It never deletes a tag or a release. If CI fails after the tag is pushed it
 prints `gh run rerun <id> --failed`, which is what recovered v0.5.1.
@@ -548,13 +568,15 @@ A version with a `-` in it is a prerelease: it builds all four targets and the
 packages, and publishes to neither the tap nor crates.io. Use one to exercise
 a change to the release itself.
 
-**Merge `master` back into `develop`.** The version bump lands on `master`
-directly (`release.sh` pushes it there), so `develop` is now behind by exactly
-that commit. Open a PR merging `master` into `develop` and merge it with a
-merge commit, never squash — squashing would put master's content on `develop`
-under a new SHA and make the next release merge conflict. Skipping this step
-is the one part of a release that does not fail loudly at the time; it only
-surfaces as a conflict at the *next* release.
+**Merge `master` back into `develop` whenever `master` has a commit `develop`
+lacks.** On the route above it has none, and
+`git merge-base --is-ancestor origin/master origin/develop` succeeding says so.
+It does have one after a bump made on `master` (by `release.sh` itself, or a
+bump PR into `master`) or a hotfix merged there. Then open a PR merging
+`master` into `develop` and merge it with a merge commit, never squash —
+squashing would put master's content on `develop` under a new SHA and make the
+next release merge conflict. A skipped merge-back does not fail loudly at the
+time; it only surfaces as a conflict at the *next* release.
 
 ## The development instance
 
