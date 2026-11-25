@@ -692,7 +692,55 @@ pub fn parse_prompt(rows: &[String]) -> Option<Prompt> {
     // The review lists every question with its answer: all of it is
     // context, and the heading is the question being asked.
     let question = if review { REVIEW_HEADING.to_string() } else { above.pop().unwrap_or_default() };
-    Some(Prompt { question, context: above, options, selected })
+    // A permission prompt puts what is being permitted — the command, the
+    // file, the warning — above a blank row over "Do you want to proceed?",
+    // so the paragraph walk alone found a bare yes/no with nothing to judge.
+    // Only when the walk stopped at a blank row: a rule means the paragraph
+    // was already the box's whole text, and a full walk means it was long.
+    let mut context = if review || is_rule(&rows[i]) || !rows[i].trim().is_empty() {
+        Vec::new()
+    } else {
+        prompt_body(&rows[..i]).unwrap_or_default()
+    };
+    context.extend(above);
+    Some(Prompt { question, context, options, selected })
+}
+
+/// The longest prompt body carried whole. Beyond it the head is kept, since
+/// that is where a tool prompt names the tool and the command starts.
+const MAX_BODY_ROWS: usize = 40;
+
+/// The rows of the box a menu is drawn in, from just under its top edge to
+/// `rows`' end, cleaned for reading: the `│` gutter a command is drawn in
+/// removed, the `╌` rules around it and blank rows dropped.
+///
+/// `None` unless the box is unmistakable: a full `─` rule above, or — when a tall command has pushed that edge off the
+/// screen — a `╌` rule, which only a tool prompt draws. Anything else would
+/// read the transcript above as part of the question.
+fn prompt_body(rows: &[String]) -> Option<Vec<String>> {
+    let dashed = |r: &str| {
+        let t = r.trim();
+        t.chars().count() >= 3 && t.chars().all(|c| c == '╌')
+    };
+    let start = match rows.iter().rposition(|r| is_rule(r)) {
+        Some(edge) => edge + 1,
+        None if rows.iter().any(|r| dashed(r)) => 0,
+        None => return None,
+    };
+    let mut body: Vec<String> = rows[start..]
+        .iter()
+        .filter(|r| !dashed(r))
+        .map(|r| {
+            let t = r.trim();
+            t.strip_prefix('│').map(str::trim).unwrap_or(t).to_string()
+        })
+        .filter(|t| !t.is_empty())
+        .collect();
+    if body.len() > MAX_BODY_ROWS {
+        body.truncate(MAX_BODY_ROWS);
+        body.push("…".into());
+    }
+    Some(body)
 }
 
 fn number_of(t: &str) -> Option<(usize, String)> {
@@ -1233,6 +1281,94 @@ cancel
   ⏵⏵ auto mode on (shift+tab to cycle) · esc to interrupt · ← for agents
                                                             ◐ medium · /effort
 ";
+
+    // A Bash permission prompt at 44 columns, captured from Claude Code
+    // 2.1.330 in default permission mode. The command sits in a `│` gutter
+    // between `╌` rules, above a blank row over the question.
+    //
+    // Revert-checks performed, all restored: not calling `prompt_body` fails
+    // both Bash tests (the old bare "proceed? yes/no"); dropping its `╌`
+    // fallback fails the scrolled-off one; keeping the `│` gutter fails both.
+    const BASH_NARROW: &str = "\
+● Bash(mkdir -p demo && cd demo && printf
+      \"a\\nb\\nc\\n\" > one.txt && printf
+      \"x\\ny\\n\" > two.txt && ls -la && wc -l
+      one.txt two.txt)
+  ⎿  Waiting…
+
+────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for
+ you — choose \"switch to auto mode\" below
+ Write two demo files
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ mkdir -p demo && cd demo && printf
+ │ \"a\\nb\\nc\\n\" > one.txt && printf \"x\\ny\\n\"
+ │ > two.txt && ls -la && wc -l one.txt
+ │ two.txt
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ │ Compound command contains cd with write
+ │ operation - manual approval required to
+ │ prevent path resolution bypass
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for mkdir -p
+      demo, \"printf \\\"a\\\\nb\\\\nc\\\\n\\\"\", and
+      \"printf \\\"x\\\\ny\\\\n\\\"\" commands in
+      /tmp/claude-1001/-home-claude-project
+      s-roost/56b84660-5f85-4803-8c5f-4c222
+      a475e24/scratchpad/permcap
+   3. Yes, and switch to auto mode · auto
+      mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend
+";
+
+    #[test]
+    fn a_bash_prompt_carries_the_command_it_asks_about() {
+        let p = live_from_rows(&rows(BASH_NARROW)).prompt.expect("a menu");
+        assert_eq!(p.question, "Do you want to proceed?");
+        assert_eq!(p.context.first().map(String::as_str), Some("Bash command"), "{:?}", p.context);
+        assert!(p.context.iter().any(|c| c == "Write two demo files"), "the description: {:?}", p.context);
+        assert!(p.context.iter().any(|c| c == "mkdir -p demo && cd demo && printf"),
+            "the command, out of its gutter: {:?}", p.context);
+        assert!(p.context.iter().any(|c| c.starts_with("Compound command contains cd")), "the warning: {:?}", p.context);
+        assert!(!p.context.iter().any(|c| c.contains('╌') || c.starts_with('│') || c.is_empty()), "{:?}", p.context);
+        assert!(!p.context.iter().any(|c| c.contains("Waiting")), "nothing from above the box: {:?}", p.context);
+        assert_eq!(p.options.len(), 4);
+    }
+
+    /// A command taller than the screen pushes the box's top edge off it.
+    /// The `╌` rule still says this is a tool prompt, so the screen's top
+    /// is the box's.
+    #[test]
+    fn a_bash_prompt_whose_top_edge_scrolled_off_still_carries_the_command() {
+        let all = rows(BASH_NARROW);
+        let edge = all.iter().position(|r| is_rule(r)).expect("the fixture has its edge");
+        let p = live_from_rows(&all[edge + 1..]).prompt.expect("a menu");
+        assert_eq!(p.context.first().map(String::as_str), Some("Bash command"), "{:?}", p.context);
+        assert!(p.context.iter().any(|c| c == "> two.txt && ls -la && wc -l one.txt"), "{:?}", p.context);
+    }
+
+    /// Without a rule of either kind nothing marks where the prompt starts,
+    /// and the transcript above must not be read as its question.
+    #[test]
+    fn a_menu_with_no_box_above_takes_no_transcript_as_context() {
+        let screen = "\
+● Earlier the assistant said something long.
+
+ Pick one?
+ ❯ 1. This
+   2. That
+
+ Esc to cancel
+";
+        let p = live_from_rows(&rows(screen)).prompt.expect("a menu");
+        assert_eq!(p.question, "Pick one?");
+        assert!(p.context.is_empty(), "{:?}", p.context);
+    }
 
     #[test]
     fn reads_a_permission_prompt() {
