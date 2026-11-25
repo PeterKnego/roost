@@ -25,6 +25,11 @@ const chat = {
   retryTimer: 0,
   hidden: false,
   atts: [], // attachments since the last send: { name, image, state, el }
+  // Subagents opened from an Agent card, outermost first: { tool, title }.
+  // The server streams only the innermost; the stack is for "back".
+  agents: [],
+  sub: null, // the subagent log element
+  subItems: new Map(),
 };
 
 const CHAT_STICK_PX = 80;
@@ -47,7 +52,13 @@ function buildChat() {
       <button type="button" class="chatterm" title="show the terminal">terminal</button>
     </div>
     <div class="chatbanner" hidden></div>
+    <div class="chatagentbar" hidden>
+      <button type="button" class="chatagentback" aria-label="back to the conversation">&#8249;</button>
+      <span class="chatagenttitle"></span>
+      <span class="chatagentstate"></span>
+    </div>
     <div class="chatlog" aria-live="polite"></div>
+    <div class="chatlog chatsublog" aria-live="polite" hidden></div>
     <button type="button" class="chatdown" hidden aria-label="scroll to newest">&#8595;</button>
     <div class="chatlive"></div>
     <div class="chatkeys" hidden>
@@ -69,6 +80,7 @@ function buildChat() {
   document.body.appendChild(root);
   chat.root = root;
   chat.log = root.querySelector(".chatlog");
+  chat.sub = root.querySelector(".chatsublog");
   const input = root.querySelector(".chatinput");
 
   root.querySelector(".chatback").onclick = () => closeChat();
@@ -84,10 +96,15 @@ function buildChat() {
     b.addEventListener("pointerdown", (e) => { e.preventDefault(); chatKey(b.dataset.k); });
   }
   root.querySelector(".chatdown").onclick = () => scrollChatToEnd(true);
-  chat.log.addEventListener("scroll", () => {
-    if (atChatEnd()) root.querySelector(".chatdown").hidden = true;
-  }, { passive: true });
-  chat.log.addEventListener("click", onChatClick);
+  for (const l of [chat.log, chat.sub]) {
+    l.addEventListener("scroll", () => {
+      if (atChatEnd()) root.querySelector(".chatdown").hidden = true;
+    }, { passive: true });
+    l.addEventListener("click", onChatClick);
+  }
+  // Back is the browser's: each subagent level is a history entry, so the
+  // phone's back gesture climbs out one level at a time.
+  root.querySelector(".chatagentback").onclick = () => history.back();
   root.querySelector(".chatlive").addEventListener("click", onChatClick);
 
   const grow = () => {
@@ -302,11 +319,17 @@ function closeChat(fromPop) {
   if (chat.sock) { chat.sock.onclose = null; chat.sock.close(); }
   chat.sock = null;
   chat.session = null;
-  if (!fromPop && history.state && history.state.roostChat) history.back();
+  // One entry for the chat and one per subagent level opened in it.
+  const depth = chat.agents.length;
+  chat.agents = [];
+  if (!fromPop && history.state && history.state.roostChat) history.go(-1 - depth);
 }
 
-window.addEventListener("popstate", () => {
-  if (chat.root && !chat.root.hidden) closeChat(true);
+window.addEventListener("popstate", (ev) => {
+  if (!chat.root || chat.root.hidden) return;
+  const st = ev.state;
+  if (st && st.roostChat === chat.session) { showAgents(st.agents || []); return; }
+  closeChat(true);
 });
 
 /// Steps away to look at something (a file, the terminal) without ending
@@ -341,6 +364,8 @@ function showTerminalFromChat() {
 function resetChatLog() {
   chat.items.clear();
   chat.log.textContent = "";
+  chat.agents = [];
+  showAgentView();
   chat.live = null;
   chat.root.querySelector(".chatlive").textContent = "";
   setChatBanner("");
@@ -358,7 +383,15 @@ function connectChat() {
     try { m = JSON.parse(ev.data); } catch { return; }
     onChatMessage(m);
   };
-  sock.onopen = () => { chat.retry = 0; };
+  sock.onopen = () => {
+    chat.retry = 0;
+    // A reconnect starts the server with no subagent chosen.
+    if (chat.agents.length) {
+      chat.subItems.clear();
+      chat.sub.textContent = "";
+      chatAgentSend();
+    }
+  };
   sock.onclose = () => {
     if (chat.sock !== sock || !chat.session) return;
     chat.sock = null;
@@ -381,7 +414,13 @@ function onChatMessage(m) {
       else setChatBanner(m.note || "No conversation found for this terminal.", true);
       break;
     case "entries":
-      renderChatEntries(m.reset, m.items || []);
+      renderChatEntries(m.reset, m.items || [], chat.log, chat.items);
+      break;
+    case "agent":
+      if (topAgent() && m.tool === topAgent().tool) renderAgentState(m);
+      break;
+    case "agent_entries":
+      if (topAgent() && m.tool === topAgent().tool) renderChatEntries(m.reset, m.items || [], chat.sub, chat.subItems);
       break;
     case "live":
       renderChatLive(m);
@@ -414,13 +453,85 @@ function chatFlash(msg) {
   setTimeout(() => b.remove(), 3500);
 }
 
+// ---- subagents ------------------------------------------------------------
+//
+// An Agent card opens that subagent's own conversation, read from the
+// transcript Claude Code keeps for it. Read-only: what is typed here goes to
+// the terminal, which is the main conversation, so the composer is hidden
+// while a subagent is shown. A menu on the screen (a subagent's permission
+// prompt is drawn there too) still shows and can still be answered.
+
+function topAgent() {
+  return chat.agents[chat.agents.length - 1] || null;
+}
+
+function openAgent(tool, title) {
+  if (!tool) return;
+  const agents = [...chat.agents, { tool, title }];
+  history.pushState({ roostChat: chat.session, agents }, "");
+  showAgents(agents);
+}
+
+/// Makes `agents` the stack and shows its innermost level (or the main
+/// conversation when it is empty), asking the server only when that changed.
+function showAgents(agents) {
+  const before = topAgent() && topAgent().tool;
+  chat.agents = agents.map((a) => ({ tool: a.tool, title: a.title }));
+  const now = topAgent() && topAgent().tool;
+  if (before !== now) {
+    chat.subItems.clear();
+    chat.sub.textContent = "";
+    chatAgentSend();
+  }
+  showAgentView();
+  requestAnimationFrame(() => scrollChatToEnd(true));
+}
+
+function chatAgentSend() {
+  const a = topAgent();
+  if (chat.sock && chat.sock.readyState === 1) {
+    chat.sock.send(JSON.stringify({ t: "agent", tool: a ? a.tool : null }));
+  }
+}
+
+function showAgentView() {
+  if (!chat.root) return;
+  const a = topAgent();
+  const bar = chat.root.querySelector(".chatagentbar");
+  bar.hidden = !a;
+  chat.log.hidden = !!a;
+  chat.sub.hidden = !a;
+  chat.root.querySelector(".chatform").hidden = !!a;
+  if (a) {
+    chat.root.querySelector(".chatagenttitle").textContent = a.title || "Subagent";
+    chat.root.querySelector(".chatagentstate").textContent = "";
+  }
+}
+
+function renderAgentState(m) {
+  const info = m.info || {};
+  if (info.description) chat.root.querySelector(".chatagenttitle").textContent = info.description;
+  const st = chat.root.querySelector(".chatagentstate");
+  st.textContent = !m.found ? "not found" : info.finished ? "finished" : "running";
+  st.dataset.state = !m.found ? "missing" : info.finished ? "done" : "run";
+  if (!m.found && !chat.subItems.size) {
+    chat.sub.textContent = "";
+    chat.sub.appendChild(chatEl("div", "cnote",
+      "This subagent's conversation file was not found beside the session's. The terminal shows it (\u2190 for agents)."));
+  }
+}
+
+function chatVisibleLog() {
+  return topAgent() ? chat.sub : chat.log;
+}
+
 function atChatEnd() {
-  const l = chat.log;
+  const l = chatVisibleLog();
   return l.scrollHeight - l.scrollTop - l.clientHeight < CHAT_STICK_PX;
 }
 
 function scrollChatToEnd(force) {
-  const l = chat.log;
+  const l = chat.log && chatVisibleLog();
   if (!l) return;
   if (force || atChatEnd()) {
     l.scrollTop = l.scrollHeight;
@@ -428,21 +539,23 @@ function scrollChatToEnd(force) {
   }
 }
 
-function renderChatEntries(reset, items) {
-  const stick = atChatEnd();
-  if (reset) { chat.items.clear(); chat.log.textContent = ""; }
+function renderChatEntries(reset, items, log, map) {
+  const shown = log === chatVisibleLog();
+  const stick = shown && atChatEnd();
+  if (reset) { map.clear(); log.textContent = ""; }
   for (const e of items) {
     const el = renderChatEntry(e);
-    const old = chat.items.get(e.id);
+    const old = map.get(e.id);
     if (old) {
       // A tool whose result arrived: keep it open if it was.
       if (old.classList.contains("open")) el.classList.add("open");
       old.replaceWith(el);
     } else {
-      chat.log.appendChild(el);
+      log.appendChild(el);
     }
-    chat.items.set(e.id, el);
+    map.set(e.id, el);
   }
+  if (!shown) return;
   if (stick) scrollChatToEnd(true);
   else if (items.length) chat.root.querySelector(".chatdown").hidden = false;
 }
@@ -479,6 +592,18 @@ function renderChatEntry(e) {
       }
       head.appendChild(sum);
       d.appendChild(head);
+      if (e.agent) {
+        // A subagent's card opens its conversation; its result (the
+        // subagent's last word) is that conversation's last message.
+        d.classList.add("cagent");
+        head.appendChild(chatEl("span", "cagentgo", "\u203a"));
+        head.setAttribute("aria-label", `open subagent: ${e.summary}`);
+        head.onclick = (ev) => {
+          if (ev.target.closest("a")) return;
+          openAgent(e.agent, e.summary);
+        };
+        return d;
+      }
       if (e.result && e.result.text) {
         const pre = chatEl("pre", "ctoolout", e.result.text);
         linkifyChat(pre);

@@ -56,6 +56,36 @@ Each file is its own request with its own chip (thumbnail or 📄, progress,
 Thumbnails are `data:` URLs because the page's CSP allows `img-src 'self'
 data:` only.
 
+## Subagents
+
+An `Agent` (or older `Task`) card opens that subagent's own conversation.
+Claude Code 2.1 writes each subagent to
+`<session>/subagents/agent-<id>.jsonl`, beside an `agent-<id>.meta.json`
+holding `toolUseId` (the call that started it), `description`, `agentType`
+and, once done, `finished: true`. The record is written at spawn, so a
+running subagent is found too, and a nested subagent's record sits in the
+same directory keyed by its call in its parent's file — one lookup serves
+every depth.
+
+- **Who picks the file.** The client sends only `{"t":"agent","tool":id}`
+  (or `null`). The id must look like one the API mints
+  (`[A-Za-z0-9_]{1,64}`) and is only compared against records; the
+  directory comes from the main transcript `locate` already confined, and
+  the file found is confined to `~/.claude/projects` again before it is
+  read. A browser never names a path.
+- **One at a time.** The server streams one subagent (`agent` for its
+  record when it changes, `agent_entries` like `entries`), re-reading the
+  record every 3 s so *running* becomes *finished*. The client holds the
+  stack, one history entry per level, so the back button and the phone's
+  back gesture climb out a level at a time and a reconnect re-asks for the
+  innermost.
+- **Read-only.** What the chat types goes to the PTY, which is the main
+  conversation, so the composer is hidden while a subagent is shown. The
+  live menu stays: a subagent's permission prompt is drawn on the same
+  screen and is answered from there.
+- **Not found** (an older Claude Code that kept sidechains inline, or a
+  record not written yet) says so and points at the terminal.
+
 ## Socket
 
 `/ws/{project}/chat/{session}`: Origin-checked like every browser socket;
@@ -75,5 +105,7 @@ Web links open in a new tab; paths open in roost with a "Chat" pill back.
 `src/chat.rs`: 18 unit tests over screens captured from Claude Code 2.1.327
 and 2.1.330 (permission prompt, trust dialog, AskUserQuestion at phone width,
 the multi-question review), transcript tailing, locate's pid-reuse refusal
-and the paste filter (both revert-checked). No browser test yet: it needs a
-fake Claude, listed as a follow-up in #209.
+and the paste filter (both revert-checked). Subagents: `locate_agent`'s
+lookup, confinement and id-shape refusal, sidechain reading and Agent-card
+marking (each revert-checked), and `tests/browser/chatagents.mjs`, which
+drives the view against a fake `claude` the real `locate` finds by `/proc`.
