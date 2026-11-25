@@ -14,7 +14,7 @@ squash-merged. Releases are cut by the maintainer.
 
 `develop` requires a pull request and green CI, and that applies to the
 maintainer too — including the merge of `master` back into `develop`, needed
-whenever `master` holds a commit `develop` lacks (a version bump made on
+whenever `master` holds a change `develop` lacks (a version bump made on
 `master`, a hotfix), which therefore goes through a PR like anything else.
 Releases bump the version on `develop` before the promote, so a normal release
 needs none (see `docs/deploy.md`, "Cutting a release"). That merge-back
