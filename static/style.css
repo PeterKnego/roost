@@ -1721,6 +1721,19 @@ header button.proj:hover svg { opacity: 1; }
 .chatlog a, .chatlive a { color: var(--accent); }
 .clink, #chat code a, #chat .casst code a { color: var(--accent); text-decoration: underline dotted; cursor: pointer; }
 .ctool { border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); font-size: 13px; }
+.cagent .ctoolhead { cursor: pointer; }
+.cagent .ctoolhead:active { filter: brightness(1.2); }
+.cagentgo { margin-left: auto; padding: 0 4px; font-size: 20px; line-height: 1; color: var(--muted); }
+.chatagentbar { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-bottom: 1px solid var(--border);
+                background: var(--bg2); font-size: 14px; }
+.chatagentbar[hidden] { display: none; }
+.chatagentback { flex: none; width: 44px; height: 44px; border: 1px solid var(--border); border-radius: 8px;
+                 background: var(--bg); color: var(--fg); font-size: 22px; cursor: pointer; }
+.chatagentback:active { filter: brightness(.85); }
+.chatagenttitle { flex: 1; min-width: 0; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chatagentstate { flex: none; font-size: 12px; color: var(--muted); }
+.chatagentstate[data-state="run"]::before { content: "● "; color: var(--accent); }
+.chatlog[hidden], .chatform[hidden] { display: none; }
 .ctoolhead { display: flex; gap: 6px; align-items: baseline; width: 100%; text-align: left; min-height: 36px;
              padding: 6px 10px; border: 0; background: transparent; color: var(--fg); font: inherit; cursor: pointer; }
 .ctoolst { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); align-self: center; }

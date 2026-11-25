@@ -83,6 +83,10 @@ pub enum Item {
         path: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         result: Option<ToolResult>,
+        /// The call's own id when it started a subagent, which is what the
+        /// client asks for to open that subagent's conversation.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        agent: Option<String>,
     },
     /// Something that happened rather than something said: an interruption,
     /// a compaction, a local command's output.
@@ -119,10 +123,23 @@ pub struct Transcript {
     reset: bool,
     project: String,
     dir: PathBuf,
+    /// A subagent's transcript, where every line is a sidechain line.
+    sidechain: bool,
 }
 
 impl Transcript {
     pub fn open(path: PathBuf, project: &str, dir: &Path) -> Transcript {
+        Transcript::open_as(path, project, dir, false)
+    }
+
+    /// A subagent's own transcript (`subagents/agent-<id>.jsonl`), whose
+    /// lines all carry `isSidechain` — the mark that, in the main file, means
+    /// "not this conversation".
+    pub fn open_subagent(path: PathBuf, project: &str, dir: &Path) -> Transcript {
+        Transcript::open_as(path, project, dir, true)
+    }
+
+    fn open_as(path: PathBuf, project: &str, dir: &Path, sidechain: bool) -> Transcript {
         Transcript {
             path,
             offset: 0,
@@ -134,6 +151,7 @@ impl Transcript {
             reset: true,
             project: project.to_string(),
             dir: dir.to_path_buf(),
+            sidechain,
         }
     }
 
@@ -150,7 +168,7 @@ impl Transcript {
         let len = meta.len();
         if len < self.offset {
             // Truncated or replaced: start over.
-            *self = Transcript::open(self.path.clone(), &self.project.clone(), &self.dir.clone());
+            *self = Transcript::open_as(self.path.clone(), &self.project.clone(), &self.dir.clone(), self.sidechain);
         }
         let mut skip_first_line = false;
         if self.offset == 0 && len > INITIAL_TAIL_BYTES {
@@ -221,8 +239,9 @@ impl Transcript {
 
     /// One transcript line. Returns whether it produced or changed an entry.
     pub fn ingest(&mut self, v: &serde_json::Value) -> bool {
-        // A subagent's own turns are not this conversation's.
-        if v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
+        // A subagent's own turns are not this conversation's — unless this is
+        // the subagent's own file.
+        if !self.sidechain && v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true) {
             return false;
         }
         if v.get("isCompactSummary").and_then(|b| b.as_bool()) == Some(true) {
@@ -280,9 +299,11 @@ impl Transcript {
                             let name = b.get("name").and_then(|t| t.as_str()).unwrap_or("tool").to_string();
                             let input = b.get("input").cloned().unwrap_or(serde_json::Value::Null);
                             let (summary, path) = tool_summary(&name, &input, &self.dir);
-                            let id = self.push(Item::Tool { name, summary, path, result: None });
-                            if let Some(tid) = b.get("id").and_then(|t| t.as_str()) {
-                                self.tools.insert(tid.to_string(), id);
+                            let tid = b.get("id").and_then(|t| t.as_str()).map(str::to_string);
+                            let agent = tid.clone().filter(|t| starts_subagent(&name) && valid_tool_id(t));
+                            let id = self.push(Item::Tool { name, summary, path, result: None, agent });
+                            if let Some(tid) = tid {
+                                self.tools.insert(tid, id);
                             }
                             changed = true;
                         }
@@ -879,6 +900,73 @@ fn confined(home: &Path, p: &Path) -> Option<PathBuf> {
     (real.starts_with(&root) && real.extension().and_then(|e| e.to_str()) == Some("jsonl")).then_some(real)
 }
 
+/// The tools whose call starts a subagent: `Agent`, and `Task`, its name
+/// before Claude Code renamed it.
+fn starts_subagent(name: &str) -> bool {
+    name == "Agent" || name == "Task"
+}
+
+/// A tool-use id as the API mints them (`toolu_` and base62). It arrives from
+/// the browser and is only ever compared, never joined into a path, but a
+/// bound on its shape keeps anything else from being looked up at all.
+pub fn valid_tool_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Subagent records looked at per lookup. A session that has run thousands
+/// of subagents has a phone user scrolling back further than this view is for.
+const MAX_AGENT_RECORDS: usize = 2000;
+
+/// What Claude Code records about a subagent beside its transcript.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentInfo {
+    pub description: String,
+    pub agent_type: String,
+    /// `finished` in the record. Absent while it runs.
+    pub finished: bool,
+}
+
+/// The transcript of the subagent that tool call `tool` started in the
+/// conversation at `main`.
+///
+/// Claude Code writes each subagent to `<session>/subagents/agent-<id>.jsonl`
+/// beside a `.meta.json` naming the `toolUseId` that started it — written at
+/// spawn, so a running subagent is found too. A nested subagent's record is
+/// in the same directory, keyed by its own call in its parent's transcript,
+/// so one lookup serves every depth. The directory is derived from `main`,
+/// which `locate` already confined; the file found is confined again before
+/// it is returned. `None` covers both "no such subagent" and "cannot tell":
+/// nothing here is destroyed, only not shown.
+pub fn locate_agent(home: &Path, main: &Path, tool: &str) -> Option<(PathBuf, AgentInfo)> {
+    if !valid_tool_id(tool) {
+        return None;
+    }
+    let dir = main.with_extension("").join("subagents");
+    let rd = std::fs::read_dir(&dir).ok()?;
+    for e in rd.flatten().take(MAX_AGENT_RECORDS * 2) {
+        let name = e.file_name();
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".meta.json")) else { continue };
+        let Ok(f) = std::fs::File::open(e.path()) else { continue };
+        let mut raw = String::new();
+        if f.take(64 * 1024).read_to_string(&mut raw).is_err() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+        if v.get("toolUseId").and_then(|t| t.as_str()) != Some(tool) {
+            continue;
+        }
+        let path = confined(home, &dir.join(format!("{stem}.jsonl")))?;
+        let text = |k: &str| v.get(k).and_then(|t| t.as_str()).unwrap_or("").to_string();
+        let info = AgentInfo {
+            description: text("description"),
+            agent_type: text("agentType"),
+            finished: v.get("finished").and_then(|b| b.as_bool()) == Some(true),
+        };
+        return Some((path, info));
+    }
+    None
+}
+
 fn claude_pids(proc_root: &Path, project: &str, session: &str) -> Vec<u32> {
     let Ok(rd) = std::fs::read_dir(proc_root) else { return Vec::new() };
     let mut out = Vec::new();
@@ -1016,9 +1104,16 @@ fn run(
     let mut last_live: Option<Live> = None;
     let mut last_locate: Option<Instant> = None;
     let mut last_live_at = Instant::now() - Duration::from_secs(10);
+    // The subagent being looked at, by the call that started it, and what
+    // was last said about it. One at a time: the client keeps the stack.
+    let mut agent: Option<AgentView> = None;
     loop {
         match ws.read() {
             Ok(Message::Text(t)) => {
+                if let Some(want) = agent_request(&t) {
+                    agent = want.map(AgentView::new);
+                    continue;
+                }
                 let reply = handle_in(&t, &att.key);
                 if let Some(err) = reply {
                     if !send(ws, serde_json::json!({"t": "error", "msg": err})) {
@@ -1082,6 +1177,14 @@ fn run(
                 }
             }
         }
+        if let Some(a) = agent.as_mut() {
+            let main = transcript.as_ref().map(|t| t.path().to_path_buf());
+            for v in a.tick(home.as_deref(), main.as_deref(), project, dir) {
+                if !send(ws, v) {
+                    return;
+                }
+            }
+        }
         if output || last_live_at.elapsed() > Duration::from_millis(1500) {
             last_live_at = Instant::now();
             if let Some(snap) = crate::session::screen_snapshot(&att.key) {
@@ -1097,6 +1200,70 @@ fn run(
             }
         }
     }
+}
+
+/// A subagent opened in the chat: its transcript, read the same way as the
+/// main one, and its record re-read now and then so "running" turns into
+/// "finished" without the client asking again.
+struct AgentView {
+    tool: String,
+    transcript: Option<Transcript>,
+    sent_rev: u64,
+    said: Option<(bool, Option<AgentInfo>)>,
+    last_look: Option<Instant>,
+}
+
+impl AgentView {
+    fn new(tool: String) -> AgentView {
+        AgentView { tool, transcript: None, sent_rev: 0, said: None, last_look: None }
+    }
+
+    /// What to send this tick: the record when it changed, then entries.
+    fn tick(&mut self, home: Option<&Path>, main: Option<&Path>, project: &str, dir: &Path) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        if self.last_look.map(|t| t.elapsed() > Duration::from_secs(3)).unwrap_or(true) {
+            self.last_look = Some(Instant::now());
+            let found = match (home, main) {
+                (Some(h), Some(m)) => locate_agent(h, m, &self.tool),
+                _ => None,
+            };
+            if let Some((p, _)) = &found {
+                if self.transcript.as_ref().map(|t| t.path() != p.as_path()).unwrap_or(true) {
+                    self.transcript = Some(Transcript::open_subagent(p.clone(), project, dir));
+                    self.sent_rev = 0;
+                }
+            }
+            let said = (found.is_some(), found.map(|(_, i)| i));
+            if self.said.as_ref() != Some(&said) {
+                out.push(serde_json::json!({
+                    "t": "agent", "tool": self.tool, "found": said.0, "info": said.1,
+                }));
+                self.said = Some(said);
+            }
+        }
+        if let Some(t) = self.transcript.as_mut() {
+            t.poll();
+            let (reset, items, rev) = t.take_changes(self.sent_rev);
+            if reset || !items.is_empty() {
+                self.sent_rev = rev;
+                out.push(serde_json::json!({
+                    "t": "agent_entries", "tool": self.tool, "reset": reset, "items": items,
+                }));
+            }
+        }
+        out
+    }
+}
+
+/// `Some(want)` when `text` is the client choosing which subagent to look at
+/// (`Some(None)` to look at none); `None` when it is anything else. A tool id
+/// of the wrong shape reads as none, never as a lookup.
+fn agent_request(text: &str) -> Option<Option<String>> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    if v.get("t").and_then(|t| t.as_str()) != Some("agent") {
+        return None;
+    }
+    Some(v.get("tool").and_then(|t| t.as_str()).filter(|t| valid_tool_id(t)).map(str::to_string))
 }
 
 /// One message from the client. `Some(reason)` is a refusal to show.
@@ -1486,8 +1653,9 @@ cancel
         assert_eq!(kinds.len(), 5, "{kinds:?}");
         assert_eq!(kinds[0], &Item::User { text: "run ls".into() });
         match kinds[1] {
-            Item::Tool { name, summary, path, result } => {
+            Item::Tool { name, summary, path, result, agent } => {
                 assert_eq!(name, "Edit");
+                assert_eq!(agent, &None, "an Edit starts no subagent");
                 assert_eq!(summary, "src/a.rs");
                 assert_eq!(path.as_deref(), Some("src/a.rs"));
                 assert_eq!(result, &Some(ToolResult { ok: true, text: "ok".into() }));
@@ -1500,6 +1668,132 @@ cancel
         }
         assert_eq!(kinds[3], &Item::User { text: "/model opus".into() });
         assert_eq!(kinds[4], &Item::Note { text: "Interrupted".into() });
+    }
+
+    /// The subagent's own file is all sidechain lines. Read as the main
+    /// conversation it is empty — which is right there and was the whole
+    /// subagent view before this — and read as a subagent's it is the
+    /// subagent's conversation.
+    ///
+    /// Revert-checked, restored: dropping the `!self.sidechain &&` guard
+    /// leaves the subagent's transcript empty and this fails on its count.
+    #[test]
+    fn a_subagent_file_reads_as_its_own_conversation() {
+        let lines = [
+            serde_json::json!({"type":"user","isSidechain":true,"agentId":"a1","message":{"role":"user","content":"Find the config loader"}}),
+            serde_json::json!({"type":"assistant","isSidechain":true,"agentId":"a1","message":{"content":[{"type":"tool_use","id":"tu9","name":"Grep","input":{"pattern":"load_config"}}]}}),
+            serde_json::json!({"type":"user","isSidechain":true,"agentId":"a1","message":{"content":[{"type":"tool_result","tool_use_id":"tu9","content":"src/config.rs"}]}}),
+            serde_json::json!({"type":"assistant","isSidechain":true,"agentId":"a1","message":{"content":[{"type":"text","text":"It is in src/config.rs."}]}}),
+        ];
+        let mut main = Transcript::open(PathBuf::from("/m.jsonl"), "proj", Path::new("/p"));
+        let mut sub = Transcript::open_subagent(PathBuf::from("/s.jsonl"), "proj", Path::new("/p"));
+        for l in &lines {
+            main.ingest(l);
+            sub.ingest(l);
+        }
+        assert!(main.take_changes(0).1.is_empty(), "the main view still skips sidechain lines");
+        let items: Vec<Item> = sub.take_changes(0).1.into_iter().map(|e| e.item).collect();
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert_eq!(items[0], Item::User { text: "Find the config loader".into() });
+        assert!(matches!(&items[1], Item::Tool { name, result: Some(r), .. } if name == "Grep" && r.text == "src/config.rs"), "{items:?}");
+    }
+
+    /// The card a subagent's call makes carries the call's id; no other card
+    /// does. `Task` is the same tool under its older name.
+    #[test]
+    fn an_agent_call_is_marked_with_the_id_that_opens_it() {
+        let mut t = Transcript::open(PathBuf::from("/m.jsonl"), "proj", Path::new("/p"));
+        t.ingest(&serde_json::json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"toolu_01Abc","name":"Agent","input":{"description":"Survey the tests","prompt":"..."}},
+            {"type":"tool_use","id":"toolu_02Def","name":"Task","input":{"description":"Older name","prompt":"..."}},
+            {"type":"tool_use","id":"toolu_03Ghi","name":"Bash","input":{"command":"ls"}},
+            {"type":"tool_use","id":"../../etc","name":"Agent","input":{"description":"odd id"}}
+        ]}}));
+        let agents: Vec<Option<String>> = t
+            .take_changes(0)
+            .1
+            .into_iter()
+            .map(|e| match e.item {
+                Item::Tool { agent, .. } => agent,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(agents, [Some("toolu_01Abc".into()), Some("toolu_02Def".into()), None, None]);
+    }
+
+    /// A `~/.claude/projects/<dir>/<session>.jsonl` with its `subagents/`.
+    fn agent_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let tdir = d.path().join(".claude/projects/-p-proj");
+        let subs = tdir.join("sess1/subagents");
+        std::fs::create_dir_all(&subs).unwrap();
+        let main = tdir.join("sess1.jsonl");
+        std::fs::write(&main, "").unwrap();
+        // A sibling first, so the lookup has to match rather than take the
+        // first record it sees.
+        std::fs::write(subs.join("agent-a0.meta.json"), r#"{"toolUseId":"toolu_other","description":"other"}"#).unwrap();
+        std::fs::write(subs.join("agent-a0.jsonl"), "").unwrap();
+        std::fs::write(
+            subs.join("agent-a1.meta.json"),
+            r#"{"agentType":"Explore","description":"Survey the tests","toolUseId":"toolu_01Abc"}"#,
+        )
+        .unwrap();
+        std::fs::write(subs.join("agent-a1.jsonl"), "{}\n").unwrap();
+        // Nested: started by a call inside a1's own transcript, recorded in
+        // the same directory.
+        std::fs::write(
+            subs.join("agent-a2.meta.json"),
+            r#"{"agentType":"general-purpose","description":"Deeper","toolUseId":"toolu_09Nest","finished":true}"#,
+        )
+        .unwrap();
+        std::fs::write(subs.join("agent-a2.jsonl"), "{}\n").unwrap();
+        let main = std::fs::canonicalize(main).unwrap();
+        (d, main, subs)
+    }
+
+    #[test]
+    fn locate_agent_finds_the_subagent_its_call_started() {
+        let (d, main, subs) = agent_fixture();
+        let (p, info) = locate_agent(d.path(), &main, "toolu_01Abc").expect("found");
+        assert_eq!(p, std::fs::canonicalize(subs.join("agent-a1.jsonl")).unwrap());
+        assert_eq!(info, AgentInfo { description: "Survey the tests".into(), agent_type: "Explore".into(), finished: false });
+        let (p2, info2) = locate_agent(d.path(), &main, "toolu_09Nest").expect("a nested one too");
+        assert!(p2.ends_with("agent-a2.jsonl"));
+        assert!(info2.finished);
+        assert_eq!(locate_agent(d.path(), &main, "toolu_nobody"), None);
+    }
+
+    /// The id comes from the browser. A shape the API never mints is not
+    /// looked up at all, and a record whose transcript resolves outside
+    /// `~/.claude/projects` is not followed there.
+    ///
+    /// Revert-checked, restored: returning `dir.join(..)` without `confined`
+    /// fails the symlink case.
+    #[test]
+    fn locate_agent_refuses_odd_ids_and_files_outside_claude_projects() {
+        let (d, main, subs) = agent_fixture();
+        // A record whose toolUseId is literally the odd string, so only the
+        // shape check can be what refuses it.
+        std::fs::write(subs.join("agent-x.meta.json"), r#"{"toolUseId":"../x"}"#).unwrap();
+        std::fs::write(subs.join("agent-x.jsonl"), "").unwrap();
+        assert_eq!(locate_agent(d.path(), &main, "../x"), None);
+        assert_eq!(locate_agent(d.path(), &main, ""), None);
+
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.jsonl");
+        std::fs::write(&secret, "{}\n").unwrap();
+        std::fs::write(subs.join("agent-ev.meta.json"), r#"{"toolUseId":"toolu_evil"}"#).unwrap();
+        std::os::unix::fs::symlink(&secret, subs.join("agent-ev.jsonl")).unwrap();
+        assert_eq!(locate_agent(d.path(), &main, "toolu_evil"), None);
+    }
+
+    #[test]
+    fn the_agent_message_is_told_apart_from_the_others() {
+        assert_eq!(agent_request(r#"{"t":"agent","tool":"toolu_01Abc"}"#), Some(Some("toolu_01Abc".into())));
+        assert_eq!(agent_request(r#"{"t":"agent","tool":null}"#), Some(None));
+        assert_eq!(agent_request(r#"{"t":"agent","tool":"../../x"}"#), Some(None), "an odd id means none");
+        assert_eq!(agent_request(r#"{"t":"send","text":"hi"}"#), None);
+        assert_eq!(agent_request("not json"), None);
     }
 
     #[test]

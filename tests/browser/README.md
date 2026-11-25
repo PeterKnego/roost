@@ -38,6 +38,7 @@ deno run -A tests/browser/ide.mjs       # openDiff's proposal tab (Accept/Reject
 deno run -A tests/browser/claudeterm.mjs # the ✻ button: a terminal with claude typed in, hidden when claude is not installed
 deno run -A tests/browser/resume.mjs     # the offer to continue the Claude a reboot interrupted (#18 step 2): where the button renders, and what each way of activating the placeholder asks for
 deno run -A tests/browser/claudemenu.mjs # the ✻ menu: New plus this project's past conversations, and no menu at all when there are none (needs its own HOME — the history is Claude Code's directory, not roost's)
+deno run -A tests/browser/chatagents.mjs # the chat: an Agent card opens its subagent's conversation, live, nested, and back climbs out one level at a time (fake claude, its own HOME)
 deno run -A tests/browser/worktrees.mjs # the header's worktree switcher chip + panel
 deno run -A tests/browser/longpress.mjs  # phone: a long-press is the tree's right-click; a folder can be sent to Claude; upload stays on the Files pane
 deno run -A tests/browser/worktree-launch.mjs # the ✻ prompt, worktree creation into a second tab, switcher state and removal; needs a real CDP click for window.open
