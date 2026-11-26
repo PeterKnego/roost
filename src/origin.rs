@@ -70,6 +70,15 @@ mod tests {
         vec!["https://box.example.com:8444".to_string()]
     }
 
+    /// An HTML report runs in a sandbox without `allow-same-origin`
+    /// (`routes::VIEW_SANDBOX`), so everything it sends says `Origin: null`.
+    /// Refusing that is what keeps a report's scripts off the socket.
+    #[test]
+    fn the_opaque_origin_a_sandboxed_page_sends_is_refused() {
+        assert!(!origin_allowed(Some("null"), &[]));
+        assert!(!origin_allowed(Some("null"), &allowed()));
+    }
+
     #[test]
     fn loopback_origins_always_pass() {
         assert!(origin_allowed(Some("http://127.0.0.1:8444"), &[]));

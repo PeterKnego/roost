@@ -860,6 +860,24 @@ pub fn sqlite_fragment(rel: &str) -> String {
     )
 }
 
+/// An HTML report opened as a tab: the page itself, rendered in a frame on
+/// the `.view` route (`routes::serve_view`), so its relative CSS, scripts and
+/// pictures load. The `sandbox` attribute repeats the route's own CSP
+/// sandbox: either alone keeps the report out of roost's origin, and the
+/// header is the one that also covers the page opened in a new tab.
+pub fn html_fragment(rel: &str, src: &str) -> String {
+    format!(
+        "<div class=\"path\">{}</div>\
+         <a class=\"htmlopen\" href=\"{}\" target=\"_blank\" rel=\"noopener\">open in a new tab ↗</a>\
+         <iframe class=\"htmlview\" src=\"{}\" title=\"{}\" \
+         sandbox=\"allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox\"></iframe>",
+        esc(rel),
+        esc(src),
+        esc(src),
+        esc(rel)
+    )
+}
+
 /// A video opened as a tab — a screencast, typically: the browser's own
 /// player on the raw route, which answers range requests (`serve_video`).
 /// `playsinline` keeps iOS from taking the whole screen the moment it plays;
