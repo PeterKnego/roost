@@ -860,6 +860,82 @@ pub fn sqlite_fragment(rel: &str) -> String {
     )
 }
 
+/// A `.json` file's view mode (`jsonview.rs`): the document indented and
+/// foldable, every key and scalar exactly as the file spells it, nothing
+/// written. Each object and array is a `<details>`, so folding needs no
+/// script; the two bar buttons only open or close them all.
+///
+/// A big document starts folded below its second level: thousands of open
+/// rows are slow to lay out and say less than the outline does.
+pub fn json_fragment(rel: &str, src: &str) -> String {
+    let mut out = format!("<div class=\"path\">{}</div>", esc(rel));
+    let node = match crate::jsonview::parse(src) {
+        Ok(n) => n,
+        Err(e) => {
+            out.push_str(&format!(
+                "<div class=\"jsonview\"><div class=\"jsonerr\">Not valid JSON: {} at line {}, column {}. \
+                 ✎ shows the file as it is.</div><pre class=\"jsonerrline\">{}\n{}^</pre></div>",
+                esc(e.msg),
+                e.line,
+                e.col,
+                esc(crate::jsonview::line_at(src, e.at)),
+                " ".repeat(e.col.saturating_sub(1).min(400))
+            ));
+            return out;
+        }
+    };
+    let total = node.count();
+    let open_depth = if total <= JSON_OPEN_ALL { usize::MAX } else { 2 };
+    out.push_str(&format!(
+        "<div class=\"jsonview\"><div class=\"jsonbar\">\
+         <button type=\"button\" data-j=\"open\">expand all</button>\
+         <button type=\"button\" data-j=\"close\">collapse all</button>\
+         <span class=\"jsoninfo\">view only · the file is not changed</span></div><div class=\"jtree\">"
+    ));
+    json_node(&mut out, None, &node, false, 0, open_depth);
+    out.push_str("</div></div>");
+    out
+}
+
+/// Above this many values a JSON view starts folded below its second level.
+pub const JSON_OPEN_ALL: usize = 3000;
+
+fn json_node(out: &mut String, key: Option<&str>, n: &crate::jsonview::Node<'_>, comma: bool, depth: usize, open_depth: usize) {
+    use crate::jsonview::Node;
+    let key_html = key.map(|k| format!("<span class=\"jk\">{}</span>: ", esc(k))).unwrap_or_default();
+    let tail = if comma { "<span class=\"jp\">,</span>" } else { "" };
+    let (open_b, close_b, len, what) = match n {
+        Node::Obj(kv) => ("{", "}", kv.len(), if kv.len() == 1 { "key" } else { "keys" }),
+        Node::Arr(v) => ("[", "]", v.len(), if v.len() == 1 { "item" } else { "items" }),
+        Node::Str(s) => return out.push_str(&format!("<div class=\"jl\">{key_html}<span class=\"js\">{}</span>{tail}</div>", esc(s))),
+        Node::Num(s) => return out.push_str(&format!("<div class=\"jl\">{key_html}<span class=\"jnum\">{}</span>{tail}</div>", esc(s))),
+        Node::Bool(s) => return out.push_str(&format!("<div class=\"jl\">{key_html}<span class=\"jlit\">{}</span>{tail}</div>", esc(s))),
+        Node::Null => return out.push_str(&format!("<div class=\"jl\">{key_html}<span class=\"jlit\">null</span>{tail}</div>")),
+    };
+    if len == 0 {
+        return out.push_str(&format!("<div class=\"jl\">{key_html}<span class=\"jp\">{open_b}{close_b}</span>{tail}</div>"));
+    }
+    out.push_str(&format!(
+        "<details class=\"jn\"{}><summary>{key_html}<span class=\"jp\">{open_b}</span>\
+         <span class=\"jsum\"> {len} {what} <span class=\"jp\">{close_b}</span>{tail}</span></summary><div class=\"jkids\">",
+        if depth < open_depth { " open" } else { "" }
+    ));
+    match n {
+        Node::Obj(kv) => {
+            for (i, (k, v)) in kv.iter().enumerate() {
+                json_node(out, Some(k), v, i + 1 < kv.len(), depth + 1, open_depth);
+            }
+        }
+        Node::Arr(v) => {
+            for (i, x) in v.iter().enumerate() {
+                json_node(out, None, x, i + 1 < v.len(), depth + 1, open_depth);
+            }
+        }
+        _ => {}
+    }
+    out.push_str(&format!("</div><div class=\"jclose\"><span class=\"jp\">{close_b}</span>{tail}</div></details>"));
+}
+
 /// An HTML report opened as a tab: the page itself, rendered in a frame on
 /// the `.view` route (`routes::serve_view`), so its relative CSS, scripts and
 /// pictures load. The `sandbox` attribute repeats the route's own CSP

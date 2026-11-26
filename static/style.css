@@ -315,6 +315,41 @@ main { flex: 1; min-height: 0; }
   .sqlnull input { width: 22px; height: 22px; }
   #dlg-sqlcell .dlg-buttons button { min-height: 44px; }
 }
+/* The JSON view (render::json_fragment). Strings wrap anywhere, so a long
+   value never pushes the page sideways on a phone; the depth shows as the
+   guide line each nested level draws on its left. */
+.jsonview { padding: 6px 10px 16px; font-family: var(--mono); font-size: 12.5px; line-height: 1.55; }
+.jsonbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; font-family: inherit; }
+.jsonbar button { background: var(--bg2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 3px 10px; min-height: 28px; font-size: 12px; cursor: pointer; }
+.jsonbar button:hover { background: var(--tab-hover); }
+.jsonbar button:active { background: var(--accent); color: var(--bg); }
+.jsoninfo { color: var(--muted); font-size: 11px; }
+.jtree, .jl, .jtree summary { overflow-wrap: anywhere; }
+.jkids { padding-left: 16px; margin-left: 4px; border-left: 1px solid var(--border); }
+.jclose { padding-left: 0; }
+.jtree summary { cursor: pointer; list-style: none; border-radius: 3px; }
+.jtree summary::-webkit-details-marker { display: none; }
+.jtree summary::before { content: "▸"; display: inline-block; width: 1.1em; margin-left: -1.1em; color: var(--muted); }
+.jtree details[open] > summary::before { content: "▾"; }
+.jtree summary:hover, .jtree summary:active { background: var(--tab-hover); }
+.jtree details[open] > summary .jsum { display: none; }
+.jtree details:not([open]) > .jclose { display: none; }
+.jtree { padding-left: 1.1em; }
+.jsum { color: var(--muted); }
+.jk { color: var(--accent); }
+.js { color: var(--add-fg, #7ec07e); }
+.jnum { color: var(--warn, #d19a66); }
+.jlit { color: var(--tool, #c678dd); }
+.jp { color: var(--muted); }
+.jsonerr { color: var(--warn); font-family: system-ui, sans-serif; font-size: 13px; margin: 4px 0 8px; }
+.jsonerrline { margin: 0; padding: 6px 8px; background: var(--bg2); border-radius: 4px; overflow-x: auto; }
+@media (max-width: 640px) {
+  .jsonview { font-size: 13px; padding: 6px 6px 16px; }
+  .jsonbar button { min-height: 44px; font-size: 15px; padding: 6px 14px; }
+  .jkids { padding-left: 10px; margin-left: 2px; }
+  .jtree summary { padding: 4px 0; }
+}
 /* An HTML report: the page fills what is left under the path, on white,
    since a report assumes a white page whatever roost's theme. It stays a
    frame on phones too, unlike a PDF, because a phone draws HTML in one. */

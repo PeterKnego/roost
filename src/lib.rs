@@ -30,6 +30,7 @@ pub mod idelock;
 pub mod ideport;
 pub mod idesess;
 pub mod install;
+pub mod jsonview;
 pub mod launch;
 pub mod modes;
 pub mod notify;
