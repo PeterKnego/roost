@@ -449,7 +449,8 @@ const wsUrl = (p) => `${location.protocol === "https:" ? "wss" : "ws"}://${locat
 // server-side too (SetMode refuses it, OpenTab coerces a raw Edit request to
 // Preview, and EditBuffer — the actual save chokepoint — refuses to create a
 // buffer at all), so no client bug here can make a save truncate a file.
-const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "mp4", "m4v", "mov", "webm"];
+const NO_TEXT_EDIT_EXT = ["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "mp4", "m4v", "mov", "webm",
+  "sqlite", "sqlite3", "db", "db3"];
 // Must extract the extension exactly as assets::ext_of does, or syncing the
 // lists would not sync the behaviour: take the LAST path segment (so
 // `img.d/README` has no extension rather than inheriting `d`) and require a
@@ -461,9 +462,10 @@ const extOf = (rel) => {
 };
 const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 /// Files this app can *draw* rather than only spell out: markdown renders, and
-/// so does every image, a PDF through the browser's own viewer (#121), and a
-/// video through its player. Mirrors routes.rs's IMAGE_EXT, PDF_EXT and
-/// VIDEO_EXT plus the two markdown extensions
+/// so does every image, a PDF through the browser's own viewer (#121), a
+/// video through its player, and a database as the SQLite tab. Mirrors
+/// routes.rs's IMAGE_EXT, PDF_EXT and VIDEO_EXT, sqlite.rs's SQLITE_EXT, plus
+/// the two markdown extensions
 /// render.rs's file_fragment branches on.
 ///
 /// Deliberately wider than NO_TEXT_EDIT_EXT, and the gap is the point — svg is
@@ -471,7 +473,7 @@ const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 /// records the release where gating Edit on "is it an image" silently took
 /// that away.
 const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf",
-  "mp4", "m4v", "mov", "webm"];
+  "mp4", "m4v", "mov", "webm", "sqlite", "sqlite3", "db", "db3"];
 const hasRenderedForm = (rel) => RENDERED_EXT.includes(extOf(rel));
 /// How a file opens when the user just clicks it.
 ///
@@ -1070,6 +1072,10 @@ function onEvent(ev) {
       break;
     case "RevertPlan":
       confirmRevert(ev);
+      break;
+    case "Sql":
+      // The answer to one SQLite tab request; sqlite.js matches it by seq.
+      if (window.sqlEvent) sqlEvent(ev);
       break;
     case "Reverted":
       if (ev.ok) { showBanner(ev.msg); break; }
@@ -1912,6 +1918,8 @@ function mountTab(content, t) {
       if (b.parentElement && b.parentElement.classList.contains("codeview")) gutterFor(b);
     });
     wireFragment(content);
+    // A database's tab arrives as an empty shell; sqlite.js fills it.
+    if (window.mountSqlite) content.querySelectorAll(".sqlview").forEach(mountSqlite);
     if (t.k === "File") {
       const mb = modeButton(t.rel, t.mode);
       const path = content.querySelector(".path");

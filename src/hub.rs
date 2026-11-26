@@ -1131,6 +1131,12 @@ impl Hub {
             Intent::RevertPreview { .. } | Intent::Revert { .. } => {
                 unreachable!("revert intents are diverted in wsconn before this lock is taken")
             }
+            // Diverted in wsconn for the same reason: opening a database,
+            // its busy wait and a query of up to `sqlite::DEADLINE` under
+            // this lock would stall every browser on the project.
+            Intent::Sql { .. } => {
+                unreachable!("Sql is diverted in wsconn before this lock is taken")
+            }
             // Meant to be diverted in wsconn like the ones above: a download
             // must not run under this lock, and a choice is a file write that
             // every hub then hears about. But unlike those arms this one is

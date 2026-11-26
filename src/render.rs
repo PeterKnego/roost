@@ -829,6 +829,37 @@ pub fn pdf_fragment(project: &str, rel: &str, mtime_secs: u64) -> String {
     )
 }
 
+/// A SQLite database opened as a tab: a shell that `static/sqlite.js` fills
+/// over the websocket (`Intent::Sql`). Only the controls are here, so the
+/// HTML stays in Rust; the rows are data, set with `textContent`, never
+/// markup — a database from a clone may hold `<script>` in any cell.
+pub fn sqlite_fragment(rel: &str) -> String {
+    format!(
+        "<div class=\"path\">{}</div>\
+         <div class=\"sqlview\" data-rel=\"{}\">\
+         <div class=\"sqlbar\">\
+         <select class=\"sqltables\" aria-label=\"Table\"></select>\
+         <button type=\"button\" class=\"sqlreload\" title=\"Reload\" aria-label=\"Reload\">↻</button>\
+         <button type=\"button\" class=\"sqlinsert\" hidden>+ row</button>\
+         <button type=\"button\" class=\"sqlqbtn\" aria-pressed=\"false\">SQL</button>\
+         </div>\
+         <form class=\"sqlquery\" hidden>\
+         <textarea class=\"sqlsql\" rows=\"3\" spellcheck=\"false\" autocomplete=\"off\" placeholder=\"SELECT … (read-only)\"></textarea>\
+         <button type=\"submit\" class=\"sqlrun\">Run</button>\
+         </form>\
+         <div class=\"sqlmsg\" role=\"status\"></div>\
+         <div class=\"sqlgrid\"></div>\
+         <div class=\"sqlpager\">\
+         <button type=\"button\" class=\"sqlprev\" aria-label=\"Previous page\">‹</button>\
+         <span class=\"sqlrange\"></span>\
+         <button type=\"button\" class=\"sqlnext\" aria-label=\"Next page\">›</button>\
+         </div>\
+         </div>",
+        esc(rel),
+        esc(rel)
+    )
+}
+
 /// A video opened as a tab — a screencast, typically: the browser's own
 /// player on the raw route, which answers range requests (`serve_video`).
 /// `playsinline` keeps iOS from taking the whole screen the moment it plays;
@@ -2089,6 +2120,7 @@ fn workspace_page_in(
     };
     let (sv, dv, av_js) = (av("style.css"), av("dialog.js"), av("app.js"));
     let av_chat = av("chat.js");
+    let av_sql = av("sqlite.js");
     format!(
         r#"<!doctype html>
 {html_open}<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
@@ -2213,6 +2245,20 @@ fn workspace_page_in(
     <button type="button" class="dlg-ok">Send</button>
   </div>
 </dialog>
+<!-- One cell of the SQLite tab (static/sqlite.js). Its own dialog, not
+     dlg-paste: it needs a NULL toggle and a way to delete the row, and a
+     read-only form for a view or a cut cell. -->
+<dialog id="dlg-sqlcell" class="roost">
+  <h2 class="dlg-title"></h2>
+  <label class="dlg-label" for="dlg-sqlcell-text"></label>
+  <textarea id="dlg-sqlcell-text" class="dlg-input" rows="5" autocomplete="off" spellcheck="false"></textarea>
+  <label class="sqlnull"><input type="checkbox" class="sqlnullbox"> NULL</label>
+  <div class="dlg-buttons">
+    <button type="button" class="sqldelrow danger">Delete row</button>
+    <button type="button" class="dlg-cancel">Cancel</button>
+    <button type="button" class="dlg-ok">Save</button>
+  </div>
+</dialog>
 <dialog id="dlg-choice" class="roost">
   <h2 class="dlg-title"></h2>
   <div class="dlg-body"></div>
@@ -2259,6 +2305,7 @@ fn workspace_page_in(
 <script src="/static/dialog.js?v={dv}"></script>
 <script src="/static/app.js?v={av_js}"></script>
 <script src="/static/chat.js?v={av_chat}"></script>
+<script src="/static/sqlite.js?v={av_sql}"></script>
 </body></html>"#,
         SVG_HOME = SVG_HOME,
         icons = icon_links(),

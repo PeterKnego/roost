@@ -226,6 +226,10 @@ pub enum Intent {
     /// *not* handled like one: `wsconn` diverts it before taking the hub
     /// lock, because a walk is blocking I/O. See the routing there.
     Search { q: String, seq: u64 },
+    /// One request to the SQLite tab of `rel` (`sqlite.rs`). Answered with
+    /// `Event::Sql` carrying the same `seq`, to the requester only. Diverted
+    /// in wsconn: it is file I/O with a busy wait.
+    Sql { rel: String, seq: u64, req: crate::sqlite::Req },
     /// Open `rel` and scroll to `line`. Separate from `OpenTab` because the
     /// line is navigation, not layout: `Tab` is persisted, and a line has no
     /// business surviving a restart. See the plan's "Deviation from the spec".
@@ -716,6 +720,11 @@ pub enum Event {
     /// query is one browser's business, and the overlay that asked is
     /// client-local by design.
     SearchResults { seq: u64, results: crate::search::Results },
+    /// The answer to `Intent::Sql`, to the connection that asked. `stale`:
+    /// the row an edit named changed since the page was read, so nothing
+    /// was written and the client reloads. `data` is `sqlite::run`'s, shaped
+    /// per request.
+    Sql { rel: String, seq: u64, ok: bool, msg: String, stale: bool, data: serde_json::Value },
     /// Scroll whichever pane holds `rel` to `line`. Broadcast rather than
     /// sent to the asker, so a second browser mirroring the tab follows it
     /// there — but carried as an event rather than as workspace state, so
