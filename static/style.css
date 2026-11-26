@@ -261,6 +261,60 @@ main { flex: 1; min-height: 0; }
 @media (max-width: 640px) {
   .content > .vidopen { padding: 12px 16px; min-height: 44px; font-size: 15px; }
 }
+/* The SQLite tab (sqlite.js). The grid scrolls inside its own box in both
+   directions, so a wide table never scrolls the page sideways on a phone;
+   the header row stays put while the rows scroll under it. */
+.content:has(> .sqlview) { display: flex; flex-direction: column; overflow: hidden; }
+.sqlview { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 6px; padding: 6px 8px; }
+.sqlview [hidden] { display: none !important; }
+.sqlbar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.sqlbar select, .sqlbar button, .sqlquery button, .sqlpager button {
+  background: var(--bg2); color: var(--fg); border: 1px solid var(--border); border-radius: 4px;
+  padding: 4px 10px; min-height: 30px; font: inherit; font-size: 13px; cursor: pointer; }
+.sqlbar select { min-width: 0; max-width: 100%; flex: 0 1 auto; }
+.sqlbar button:hover, .sqlquery button:hover, .sqlpager button:hover:not(:disabled) { background: var(--tab-hover); }
+.sqlbar button:active, .sqlquery button:active, .sqlpager button:active:not(:disabled) { background: var(--accent); color: var(--bg); }
+.sqlqbtn[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+.sqlpager button:disabled { opacity: .4; cursor: default; }
+.sqlquery { display: flex; gap: 6px; align-items: stretch; }
+.sqlsql { flex: 1; min-width: 0; resize: vertical; font-family: var(--mono); font-size: 13px;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 5px 7px; }
+.sqlmsg { font-size: 12px; color: var(--muted); min-height: 0; }
+.sqlmsg:empty { display: none; }
+.sqlmsg.bad { color: var(--warn); }
+.sqlgrid { flex: 1 1 auto; min-height: 0; overflow: auto; border: 1px solid var(--border); border-radius: 4px;
+  -webkit-overflow-scrolling: touch; }
+.sqlgrid table { border-collapse: separate; border-spacing: 0; font-family: var(--mono); font-size: 12px; min-width: 100%; }
+.sqlgrid th { position: sticky; top: 0; z-index: 1; background: var(--bg2); text-align: left; font-weight: 600;
+  padding: 4px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; vertical-align: bottom; }
+.sqlgrid th small { display: block; font-weight: 400; color: var(--muted); font-size: 10px; }
+.sqlgrid th.sort { cursor: pointer; user-select: none; }
+.sqlgrid th.sort:hover, .sqlgrid th.sort:active { background: var(--tab-hover); }
+.sqlgrid th[data-dir="asc"] span::after { content: " ▲"; color: var(--accent); }
+.sqlgrid th[data-dir="desc"] span::after { content: " ▼"; color: var(--accent); }
+.sqlgrid td { padding: 3px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; max-width: 280px;
+  overflow: hidden; text-overflow: ellipsis; cursor: pointer; }
+.sqlgrid td.num { text-align: right; }
+.sqlgrid td.nul { color: var(--muted); font-style: italic; }
+.sqlgrid td.edit:hover, .sqlgrid td:active { background: var(--tab-hover); }
+.sqlgrid tr.fresh td { background: var(--sel-bg, rgba(84,138,247,.15)); }
+.sqlpager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; font-size: 12px; color: var(--muted); }
+#dlg-sqlcell-text { min-height: 110px; resize: vertical; font-family: var(--mono); }
+#dlg-sqlcell-text:read-only { opacity: .85; }
+.sqlnull { display: flex; align-items: center; gap: 6px; margin: 8px 14px 0; font-size: 13px; }
+#dlg-sqlcell .sqldelrow { margin-right: auto; }
+.sqlnull[hidden] { display: none; }
+#dlg-sqlcell .dlg-buttons [hidden] { display: none; }
+@media (max-width: 640px) {
+  .sqlview { padding: 6px; }
+  .sqlbar select { flex: 1 1 100%; font-size: 16px; min-height: 44px; }
+  .sqlbar button, .sqlquery button, .sqlpager button { min-height: 44px; min-width: 44px; font-size: 15px; }
+  .sqlsql { font-size: 16px; }
+  .sqlgrid td { max-width: 180px; padding: 8px; }
+  .sqlnull { min-height: 44px; font-size: 15px; }
+  .sqlnull input { width: 22px; height: 22px; }
+  #dlg-sqlcell .dlg-buttons button { min-height: 44px; }
+}
 /* Inset from the card edge rather than bleeding into it: the fit addon sizes
    the grid from the host's *inner* box, so padding costs a column, not a
    clipped one. Left is roomier than right because the right edge is where the

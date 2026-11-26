@@ -443,6 +443,21 @@ pub fn handle(stream: TcpStream, project: &str, dir: PathBuf) {
                     }
                     continue;
                 }
+                // Diverted like a revert, and for the same reason: a database
+                // is file I/O with a busy wait and a query deadline, none of
+                // which may run under the lock every socket on the project
+                // waits on. Inline, one at a time per connection; the hub is
+                // locked only to send the answer. Wrapped because a panic
+                // must not escape a socket thread (CLAUDE.md).
+                if let Ok(proto::Intent::Sql { rel, seq, req }) = decoded {
+                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::sqlite::run(&dir, &rel, req)))
+                        .unwrap_or_else(|_| crate::sqlite::Reply {
+                            ok: false, msg: "the database request failed".into(), stale: false, data: serde_json::Value::Null,
+                        });
+                    let ev = proto::Event::Sql { rel, seq, ok: r.ok, msg: r.msg, stale: r.stale, data: r.data };
+                    Hub::lock(&hub).send_to(&id, &ev);
+                    continue;
+                }
                 // Diverted like Search and RestoreWorkspace: an update is a
                 // download and two probes, a choice is a file write that
                 // every hub then hears about, and the reply must reach only

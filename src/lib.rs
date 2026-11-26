@@ -51,6 +51,7 @@ pub mod routes;
 pub mod screen;
 pub mod search;
 pub mod session;
+pub mod sqlite;
 pub mod term;
 pub mod textdiff;
 pub mod themes;

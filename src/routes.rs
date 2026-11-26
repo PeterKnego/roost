@@ -500,8 +500,11 @@ pub const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "ic
 /// `static/app.js` keeps a copy of THIS list, for the ✎ toggle. Nothing
 /// checks the two agree — the design doc records why neither direction of
 /// mismatch loses data, because `workspace.rs` is the actual guard.
-pub const NO_TEXT_EDIT_EXT: &[&str] =
-    &["png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "mp4", "m4v", "mov", "webm"];
+pub const NO_TEXT_EDIT_EXT: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "webp", "ico", "pdf", "mp4", "m4v", "mov", "webm",
+    // `sqlite::SQLITE_EXT`. A textarea over a database is how one is truncated.
+    "sqlite", "sqlite3", "db", "db3",
+];
 
 /// Extensions served as a document for the browser's own viewer (#121) — not
 /// on `IMAGE_EXT`, because that list also decides what a markdown `<img>` may
@@ -1181,6 +1184,13 @@ fn serve_frag(
                     },
                     Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
                 },
+            },
+            // A database opens as the SQLite tab, and only if it is one: `.db`
+            // is not SQLite's alone, so the header is read first (`resolve`
+            // also confines it and refuses a FIFO).
+            Some(rel) if crate::sqlite::is_sqlite(rel) => match crate::sqlite::resolve(&dir, rel) {
+                Ok(_) => http::html(w, &render::sqlite_fragment(rel)),
+                Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
             },
             Some(rel) => match projects::safe_resolve(&dir, rel)
                 .and_then(|p| projects::read_text_file(&p))
@@ -2535,6 +2545,24 @@ mod tests {
         assert!(out.contains("playsinline"), "{out}");
         assert!(out.contains("raw?path=casts/a%26b%22c.mp4&amp;v="), "{out}");
         assert!(!out.contains("a&b\"c"), "an unescaped name reached the HTML: {out}");
+    }
+
+    // ---- SQLite ------------------------------------------------------------
+
+    /// Revert-checked: without the `is_sqlite` arm the database falls to
+    /// `read_text_file` and the first assert fails on "binary file"; without
+    /// `resolve`'s header check the text `.db` gets the tab too.
+    #[test]
+    fn the_file_fragment_for_a_database_is_the_sqlite_tab_and_only_for_one() {
+        let (d, roots) = pdf_fixture();
+        let db = d.path().join("p/docs/a&b\"c.db");
+        rusqlite::Connection::open(&db).unwrap().execute_batch("CREATE TABLE t(x);").unwrap();
+        let out = frag_route(&roots, "/frag/p/file?path=docs%2Fa%26b%22c.db");
+        assert!(out.contains("<div class=\"sqlview\" data-rel=\"docs/a&amp;b&quot;c.db\">"), "{out}");
+        assert!(!out.contains("a&b\"c"), "an unescaped name reached the HTML: {out}");
+        std::fs::write(d.path().join("p/docs/notes.db"), "plain text").unwrap();
+        let out = frag_route(&roots, "/frag/p/file?path=docs%2Fnotes.db");
+        assert!(out.contains("not a SQLite database") && !out.contains("sqlview"), "{out}");
     }
 
     // ---- PDF (#121) ---------------------------------------------------------

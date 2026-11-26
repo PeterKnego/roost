@@ -79,6 +79,14 @@ ring = "0.17"
 # which menu is up and which option is selected — and `screen.rs` keeps a byte
 # log, not a grid. Pure Rust, no C, so the musl builds are unaffected.
 vt100 = "0.18"
+# The SQLite tab (`sqlite.rs`) reads and edits a project's database in place.
+# `bundled` compiles SQLite's own C into the binary rather than linking the
+# host's: a musl tarball has no host library to link, and a database opened
+# in roost must behave the same on every install. The C needs the same
+# toolchain ring already needs on the release runners. `hooks` is for the
+# progress handler that enforces the query deadline, `limits` to forbid
+# ATTACH.
+rusqlite = { version = "0.43", features = ["bundled", "hooks", "limits"] }
 
 [dev-dependencies]
 tempfile = "3"
