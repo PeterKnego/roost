@@ -476,6 +476,12 @@ const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf",
   "mp4", "m4v", "mov", "webm", "sqlite", "sqlite3", "db", "db3", "html", "htm"];
 const hasRenderedForm = (rel) => RENDERED_EXT.includes(extOf(rel));
+/// Files with a view worth switching to that still open in Edit: JSON, whose
+/// view (render::json_fragment) is indented and foldable but read-only, and
+/// is usually wanted after the source, not instead of it. The toggle offers
+/// it; a click in the tree still edits.
+const VIEW_TOGGLE_EXT = ["json"];
+const hasViewToggle = (rel) => hasRenderedForm(rel) || VIEW_TOGGLE_EXT.includes(extOf(rel));
 /// How a file opens when the user just clicks it.
 ///
 /// Edit, for anything the editor can hold — which is what an IDE does, and
@@ -1852,7 +1858,7 @@ function modeButton(rel, mode) {
   // even once the file returned, since re-clicking it in the tree only
   // focuses the tab it already has and never revisits its mode.
   const editable = !refusesTextEdit(rel);
-  if (!editable || (mode === "Edit" && !hasRenderedForm(rel))) return null;
+  if (!editable || (mode === "Edit" && !hasViewToggle(rel))) return null;
   const b = document.createElement("button");
   b.className = "modebtn"; // NOT .savebtn: paintSaveState selects ".savebtn" and must find Save, not this
   b.innerHTML = mode === "Edit" ? MODE_ICONS.preview : MODE_ICONS.edit; // constant markup only
@@ -2638,6 +2644,16 @@ document.addEventListener("click", (e) => {
   e.preventDefault();
   e.stopPropagation();
 }, true);
+
+// The JSON view's expand/collapse all (render::json_fragment). Delegated,
+// because the view arrives as a fragment; folding one node is the
+// <details> element's own and needs nothing here.
+document.addEventListener("click", (e) => {
+  const b = e.target.closest && e.target.closest(".jsonbar button[data-j]");
+  if (!b) return;
+  const open = b.dataset.j === "open";
+  b.closest(".jsonview").querySelectorAll("details.jn").forEach((d) => { d.open = open; });
+});
 
 function wireFragment(content) {
   // Changes and Diff show changes, not places: New file, Rename and Delete

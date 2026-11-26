@@ -1270,6 +1270,14 @@ fn serve_frag(
                 Ok(_) => http::html(w, &render::sqlite_fragment(rel)),
                 Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
             },
+            // A JSON file's view mode (Edit never fetches this fragment): the
+            // document folded and indented, read-only (`render::json_fragment`).
+            Some(rel) if crate::jsonview::is_json(rel) => match projects::safe_resolve(&dir, rel)
+                .and_then(|p| projects::read_text_file(&p))
+            {
+                Ok(content) => http::html(w, &render::json_fragment(rel, &content)),
+                Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
+            },
             // An HTML report is shown rendered, in a sandboxed frame on the
             // `.view` route; its source is the ✎ Edit mode, as for markdown.
             Some(rel) if is_html(rel) => match crate::assets::normalize(rel) {
@@ -2658,6 +2666,40 @@ mod tests {
         std::fs::write(d.path().join("p/docs/notes.db"), "plain text").unwrap();
         let out = frag_route(&roots, "/frag/p/file?path=docs%2Fnotes.db");
         assert!(out.contains("not a SQLite database") && !out.contains("sqlview"), "{out}");
+    }
+
+    // ---- JSON view ------------------------------------------------------------
+
+    /// Revert-checked: without the `is_json` arm the fragment is the code
+    /// view and the tree asserts fail; with `esc` dropped from a key in
+    /// `json_node` the markup assert fails.
+    #[test]
+    fn the_file_fragment_for_json_is_a_folded_tree_that_escapes_and_changes_nothing() {
+        let (d, roots) = pdf_fixture();
+        let src = "{\"<b>k</b>\": [1e2, \"<i>v</i>\", null], \"n\": 12345678901234567890123}";
+        let f = d.path().join("p/docs/data.json");
+        std::fs::write(&f, src).unwrap();
+        let out = frag_route(&roots, "/frag/p/file?path=docs%2Fdata.json");
+        assert!(out.contains("<div class=\"jtree\">"), "{out}");
+        assert!(out.contains("<span class=\"jk\">&quot;&lt;b&gt;k&lt;/b&gt;&quot;</span>"), "{out}");
+        assert!(!out.contains("<b>k</b>") && !out.contains("<i>v</i>"), "markup from the file reached the HTML: {out}");
+        assert!(out.contains("<span class=\"jnum\">1e2</span>"), "{out}");
+        assert!(out.contains("<span class=\"jnum\">12345678901234567890123</span>"), "{out}");
+        assert!(out.contains("<details class=\"jn\" open>"), "a small document opens whole: {out}");
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), src, "the view wrote nothing");
+    }
+
+    #[test]
+    fn invalid_json_says_where_and_a_big_document_starts_folded() {
+        let (d, roots) = pdf_fixture();
+        std::fs::write(d.path().join("p/docs/bad.json"), "{\n  \"a\": 1,\n  \"b\" 2\n}").unwrap();
+        let out = frag_route(&roots, "/frag/p/file?path=docs%2Fbad.json");
+        assert!(out.contains("Not valid JSON: expected ':' after the key at line 3, column 7"), "{out}");
+        assert!(out.contains("  &quot;b&quot; 2\n      ^"), "{out}");
+        let big = format!("{{\"a\": {{\"b\": {{\"c\": [{}]}}}}}}", vec!["1"; render::JSON_OPEN_ALL].join(","));
+        std::fs::write(d.path().join("p/docs/big.json"), big).unwrap();
+        let out = frag_route(&roots, "/frag/p/file?path=docs%2Fbig.json");
+        assert_eq!(out.matches("<details class=\"jn\" open>").count(), 2, "only the top two levels open");
     }
 
     // ---- HTML reports --------------------------------------------------------
