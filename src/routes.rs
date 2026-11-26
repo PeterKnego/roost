@@ -187,6 +187,18 @@ fn route(w: &mut impl Write, req: &http::Request, roots: &[PathBuf]) {
         // this is an ordinary fragment (even one whose project path
         // contains "theme"); only otherwise does the "last theme segment"
         // rule apply, to reach into `.roost/theme/{rel}`.
+        // An HTML report, path-shaped so its relative links reach its own CSS,
+        // scripts and pictures (`serve_view`). `.view` cannot be a project's
+        // first segment, because a project directory never starts with a dot
+        // (`projects::resolve_project`), so this arm shadows no project. The
+        // project is one segment, encoded twice (`view_url`), because a key
+        // may itself hold slashes and the path is decoded before it is split.
+        ["frag", ".view", proj, rest @ ..] if !rest.is_empty() => {
+            match projects::resolve_project(roots, &http::percent_decode(proj)) {
+                Some(dir) => serve_view(w, &dir, &rest.join("/")),
+                None => http::not_found(w, "no such project"),
+            }
+        }
         ["frag", rest @ ..] if rest.len() >= 2 => {
             let (what, proj_segs) =
                 rest.split_last().expect("len >= 2 guarantees a last element");
@@ -528,6 +540,72 @@ fn video_type(rel: &str) -> &'static str {
         "mov" => "video/quicktime",
         _ => "video/mp4",
     }
+}
+
+/// Extensions shown rendered, as a page, in a sandboxed frame: an HTML report
+/// (coverage, test results, a benchmark). Unlike the lists above these stay
+/// editable; they are text, like SVG.
+pub const HTML_EXT: &[&str] = &["html", "htm"];
+
+pub fn is_html(rel: &str) -> bool {
+    HTML_EXT.contains(&crate::assets::ext_of(rel).as_str())
+}
+
+/// The sandbox an HTML report and everything it loads is served under.
+///
+/// No `allow-same-origin`, and that omission is the whole boundary. Without
+/// it the report runs in an opaque origin. Its requests carry `Origin: null`,
+/// which `origin::origin_allowed` refuses on every websocket and on both
+/// POSTs, and it cannot read a single roost response, because nothing here
+/// sends CORS headers. So a report's scripts can draw its charts and nothing
+/// else. With `allow-same-origin` added, a report from a clone could open
+/// the socket that spawns shells. That is XSS into roost, not a convenience.
+///
+/// The rest is what reports use: scripts for charts and tables, forms for
+/// their search boxes, and popups so a link can leave the frame for a tab.
+const VIEW_SANDBOX: (&str, &str) =
+    ("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox");
+
+/// Where a report's frame points: `/frag/.view/<project>/<rel>`. The project
+/// key is encoded twice: once so its own `/` stays inside one segment after
+/// the server decodes the path, and once more for the URL itself.
+pub fn view_url(project: &str, rel: &str, mtime_secs: u64) -> String {
+    let key = http::percent_encode(project).replace('/', "%2F");
+    format!("/frag/.view/{}/{}?v={mtime_secs}", http::percent_encode(&key), http::percent_encode(rel))
+}
+
+/// The type a report's file is served as. The asset table's `content_type`
+/// covers its own kinds, plus the few a report also loads.
+fn view_type(rel: &str) -> &'static str {
+    match crate::assets::ext_of(rel).as_str() {
+        "htm" => "text/html; charset=utf-8",
+        "mjs" => "text/javascript; charset=utf-8",
+        "json" | "map" => "application/json",
+        "txt" | "log" => "text/plain; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        "xml" => "application/xml",
+        "wasm" => "application/wasm",
+        _ => content_type(rel),
+    }
+}
+
+/// A file of a report: the page itself or anything it links relatively.
+/// Any file in the project may be fetched this way, as the download route
+/// already allows. What makes it safe to *render* is `VIEW_SANDBOX` on every
+/// response, the page and its subresources alike, so an SVG or a second page
+/// opened directly runs in the same opaque origin. Streamed with no size
+/// cap, like a PDF: a Playwright report embeds its data and passes 2 MB.
+fn serve_view(w: &mut impl Write, dir: &Path, rel: &str) {
+    let (f, _) = match open_regular(dir, rel) {
+        Ok(opened) => opened,
+        Err(msg) => return http::not_found(w, msg),
+    };
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n{}: {}\r\n{}: {}\r\nCache-Control: no-cache\r\n\
+         Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+        view_type(rel), NOSNIFF.0, NOSNIFF.1, VIEW_SANDBOX.0, VIEW_SANDBOX.1
+    );
+    stream_chunked(w, f, &head);
 }
 
 pub fn is_pdf(rel: &str) -> bool {
@@ -1191,6 +1269,23 @@ fn serve_frag(
             Some(rel) if crate::sqlite::is_sqlite(rel) => match crate::sqlite::resolve(&dir, rel) {
                 Ok(_) => http::html(w, &render::sqlite_fragment(rel)),
                 Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
+            },
+            // An HTML report is shown rendered, in a sandboxed frame on the
+            // `.view` route; its source is the ✎ Edit mode, as for markdown.
+            Some(rel) if is_html(rel) => match crate::assets::normalize(rel) {
+                None => http::html(w, &render::file_error_fragment(rel, "path outside project")),
+                Some(rel) => match projects::safe_resolve(&dir, rel) {
+                    Ok(path) => {
+                        let mtime_secs = std::fs::metadata(&path)
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        http::html(w, &render::html_fragment(rel, &view_url(project, rel, mtime_secs)))
+                    }
+                    Err(e) => http::html(w, &render::file_error_fragment(rel, &e)),
+                },
             },
             Some(rel) => match projects::safe_resolve(&dir, rel)
                 .and_then(|p| projects::read_text_file(&p))
@@ -2563,6 +2658,101 @@ mod tests {
         std::fs::write(d.path().join("p/docs/notes.db"), "plain text").unwrap();
         let out = frag_route(&roots, "/frag/p/file?path=docs%2Fnotes.db");
         assert!(out.contains("not a SQLite database") && !out.contains("sqlview"), "{out}");
+    }
+
+    // ---- HTML reports --------------------------------------------------------
+
+    /// A report under a nested project key with characters a URL must
+    /// escape, so `view_url`'s double encoding is exercised end to end: the
+    /// frame's URL, as the fragment writes it, goes back through `route`.
+    fn report_fixture() -> (tempfile::TempDir, Vec<PathBuf>) {
+        let d = tempfile::tempdir().unwrap();
+        let r = d.path().join("team/app x/cov 1");
+        std::fs::create_dir_all(r.join("assets")).unwrap();
+        std::fs::write(r.join("index.html"), "<link rel=stylesheet href=assets/s.css><script src=assets/a.js></script>REPORT").unwrap();
+        std::fs::write(r.join("assets/s.css"), "body{color:red}").unwrap();
+        std::fs::write(r.join("assets/a.js"), "document.title='x'").unwrap();
+        std::fs::write(r.join("assets/data.json"), "{}").unwrap();
+        let roots = vec![d.path().to_path_buf()];
+        (d, roots)
+    }
+
+    /// The `src` the fragment for `rel` in project `team/app x` points at,
+    /// unescaped back out of the HTML.
+    fn frame_src(roots: &[PathBuf], rel: &str) -> String {
+        let out = frag_route(roots, &format!("/frag/team/app%20x/file?path={}", http::percent_encode(rel)));
+        const OPEN: &str = "<iframe class=\"htmlview\" src=\"";
+        let at = out.find(OPEN).unwrap_or_else(|| panic!("no frame: {out}"));
+        let rest = &out[at + OPEN.len()..];
+        rest[..rest.find('"').unwrap()].replace("&amp;", "&")
+    }
+
+    /// Revert-checked: with `VIEW_SANDBOX` given `allow-same-origin`, the
+    /// first sandbox assert fails — and that one token is the difference
+    /// between a report and script running as roost.
+    #[test]
+    fn a_report_and_what_it_links_are_served_sandboxed_from_a_path_shaped_url() {
+        let (_d, roots) = report_fixture();
+        let src = frame_src(&roots, "cov 1/index.html");
+        assert!(src.starts_with("/frag/.view/team%252Fapp%2520x/cov%201/index.html?v="), "{src}");
+        let page = frag_route(&roots, &src);
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        assert!(page.contains("Content-Type: text/html"), "{page}");
+        assert!(page.contains("REPORT"), "{page}");
+        let csp = page.lines().find(|l| l.starts_with("Content-Security-Policy:")).unwrap_or_else(|| panic!("{page}"));
+        assert!(csp.contains("sandbox allow-scripts") && !csp.contains("allow-same-origin"), "{csp}");
+        assert!(page.contains("X-Content-Type-Options: nosniff"), "{page}");
+        // A relative link resolves against the page's own path, as a browser
+        // would: drop the last segment and the query, add the link.
+        let base = &src[..src.rfind('/').unwrap() + 1];
+        for (file, ty) in [("assets/s.css", "text/css"), ("assets/a.js", "text/javascript"), ("assets/data.json", "application/json")] {
+            let out = frag_route(&roots, &format!("{base}{file}"));
+            assert!(out.starts_with("HTTP/1.1 200") && out.contains(&format!("Content-Type: {ty}")), "{file}: {out}");
+            assert!(out.contains("Content-Security-Policy: sandbox allow-scripts"), "{file} is sandboxed too: {out}");
+        }
+    }
+
+    #[test]
+    fn the_view_route_stays_inside_its_project() {
+        let (d, roots) = report_fixture();
+        let base = "/frag/.view/team%252Fapp%2520x";
+        // In the parent project, so outside `team/app x`, the one asked for.
+        std::fs::write(d.path().join("team/secret.html"), "SECRET").unwrap();
+        for path in [
+            format!("{base}/../secret.html"),
+            format!("{base}/%2E%2E/secret.html"),
+            format!("{base}/%252E%252E/secret.html"),
+            // `..` inside the project key itself.
+            "/frag/.view/team%252Fapp%2520x%252F..%252F/secret.html".to_string(),
+            "/frag/.view/nope/index.html".to_string(),
+        ] {
+            let out = frag_route(&roots, &path);
+            assert!(out.starts_with("HTTP/1.1 404") && !out.contains("SECRET"), "{path}: {out}");
+        }
+        #[cfg(unix)]
+        {
+            let elsewhere = tempfile::tempdir().unwrap();
+            std::fs::write(elsewhere.path().join("x.html"), "SECRET").unwrap();
+            std::os::unix::fs::symlink(elsewhere.path().join("x.html"), d.path().join("team/app x/out.html")).unwrap();
+            let out = frag_route(&roots, &format!("{base}/out.html"));
+            assert!(out.starts_with("HTTP/1.1 404") && !out.contains("SECRET"), "{out}");
+        }
+        let out = frag_route(&roots, &format!("{base}/cov%201"));
+        assert!(out.starts_with("HTTP/1.1 404"), "a directory is not a page: {out}");
+    }
+
+    /// Revert-checked: without the `is_html` arm the report falls to
+    /// `read_text_file` and the fragment is its source in a code view.
+    #[test]
+    fn the_file_fragment_for_a_report_is_a_sandboxed_frame() {
+        let (d, roots) = report_fixture();
+        std::fs::write(d.path().join("team/app x/a&b\"c.html"), "x").unwrap();
+        let out = frag_route(&roots, "/frag/team/app%20x/file?path=a%26b%22c.html");
+        assert!(out.contains("<iframe class=\"htmlview\""), "{out}");
+        assert!(out.contains("sandbox=\"allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox\""), "{out}");
+        assert!(!out.contains("allow-same-origin"), "{out}");
+        assert!(out.contains("class=\"htmlopen\""), "{out}");
+        assert!(!out.contains("a&b\"c"), "an unescaped name reached the HTML: {out}");
     }
 
     // ---- PDF (#121) ---------------------------------------------------------

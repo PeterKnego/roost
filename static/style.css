@@ -315,6 +315,17 @@ main { flex: 1; min-height: 0; }
   .sqlnull input { width: 22px; height: 22px; }
   #dlg-sqlcell .dlg-buttons button { min-height: 44px; }
 }
+/* An HTML report: the page fills what is left under the path, on white,
+   since a report assumes a white page whatever roost's theme. It stays a
+   frame on phones too, unlike a PDF, because a phone draws HTML in one. */
+.content:has(> .htmlview) { display: flex; flex-direction: column; overflow: hidden; }
+.content > .htmlview { flex: 1 1 auto; min-height: 0; width: 100%; border: 0; background: #fff; }
+.content > .htmlopen { align-self: flex-end; padding: 6px 10px; font-size: 13px; color: var(--accent, #548af7);
+  text-decoration: none; min-height: 32px; box-sizing: border-box; }
+.content > .htmlopen:hover, .content > .htmlopen:active { text-decoration: underline; }
+@media (max-width: 640px) {
+  .content > .htmlopen { padding: 12px 16px; min-height: 44px; font-size: 15px; }
+}
 /* Inset from the card edge rather than bleeding into it: the fit addon sizes
    the grid from the host's *inner* box, so padding costs a column, not a
    clipped one. Left is roomier than right because the right edge is where the

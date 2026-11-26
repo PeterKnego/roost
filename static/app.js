@@ -463,9 +463,10 @@ const extOf = (rel) => {
 const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 /// Files this app can *draw* rather than only spell out: markdown renders, and
 /// so does every image, a PDF through the browser's own viewer (#121), a
-/// video through its player, and a database as the SQLite tab. Mirrors
-/// routes.rs's IMAGE_EXT, PDF_EXT and VIDEO_EXT, sqlite.rs's SQLITE_EXT, plus
-/// the two markdown extensions
+/// video through its player, a database as the SQLite tab, and an HTML
+/// report as the page it is. Mirrors routes.rs's IMAGE_EXT, PDF_EXT,
+/// VIDEO_EXT and HTML_EXT, sqlite.rs's SQLITE_EXT, plus the two markdown
+/// extensions
 /// render.rs's file_fragment branches on.
 ///
 /// Deliberately wider than NO_TEXT_EDIT_EXT, and the gap is the point — svg is
@@ -473,7 +474,7 @@ const refusesTextEdit = (rel) => NO_TEXT_EDIT_EXT.includes(extOf(rel));
 /// records the release where gating Edit on "is it an image" silently took
 /// that away.
 const RENDERED_EXT = ["md", "markdown", "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "pdf",
-  "mp4", "m4v", "mov", "webm", "sqlite", "sqlite3", "db", "db3"];
+  "mp4", "m4v", "mov", "webm", "sqlite", "sqlite3", "db", "db3", "html", "htm"];
 const hasRenderedForm = (rel) => RENDERED_EXT.includes(extOf(rel));
 /// How a file opens when the user just clicks it.
 ///
